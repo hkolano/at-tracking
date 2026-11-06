@@ -130,7 +130,7 @@ def draw_tracker_axes(frame, trackers, camera_matrix, dist_coeffs, rvec, tvec):
     if not active_trackers:
         cv2.putText(
             frame,
-            "Waiting for Object Tags (IDs 3, 4, 5)...",
+            "Waiting for object tags...",
             (20, 40),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
@@ -156,7 +156,7 @@ def annotate_frame(
         if last_reference_pose is None:
             cv2.putText(
                 frame,
-                "Waiting for Reference Tag (ID 1)...",
+                "Waiting for reference tag...",
                 (20, 40),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,

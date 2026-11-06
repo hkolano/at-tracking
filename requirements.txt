@@ -1,14 +1,8 @@
-apriltag-python
 numpy
 opencv-python
-opencv-python-headless
 pandas
-pillow
 pupil_apriltags
 pyarrow
 pyrealsense2
-python-dateutil
 scipy
-six
-pylibfranka
-torch
+pyyaml

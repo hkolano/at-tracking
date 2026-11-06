@@ -2,9 +2,7 @@
 # Tracker object tracks an object with one or more april tags (averages position)
 #
 #
-import os
 import numpy as np
-import pyrealsense2 as rs
 from scipy import linalg
 
 
@@ -48,7 +46,7 @@ class Tracker:
         }
 
     def updatePose(self, tags_in_ref):
-		# tags_in_ref gives tag poses expressed in the same frame as the
+        # tags_in_ref gives tag poses expressed in the same frame as the
         # downstream output. When reference-tag mode is disabled, that is the
         # camera frame; when enabled, it is the reference-tag frame.
         # We attach the object pose by right-multiplying the per-tag offset:

@@ -1,0 +1,59 @@
+# Copy this file and describe your own setup.
+
+# Edge length of the tag's BLACK SQUARE in metres, not the full printed tag with
+# its white border. Measure a printed tag: poses scale directly with this value.
+tag_size_m: 0.0254
+tag_family: tag36h11
+
+# Minimum detector confidence. Higher rejects more false or poor detections.
+decision_margin: 3.0
+
+# Fixed tag that defines the output frame. Leave as null for the camera frame.
+reference_tag: null
+
+camera:
+  width: 1280
+  height: 720
+  fps: 30         # 6, 15, or 30
+  exposure: 100   # null leaves auto exposure on
+
+# One entry per tracked point on the cane. The cane bends, so tags at different
+# locations must be separate objects: tags in one object are assumed rigid
+# relative to each other, and their positions are averaged.
+#
+# Tag IDs can't be shared between objects.
+objects:
+  - name: cane_0
+    tags:
+      - id: 0
+  - name: cane_1
+    tags:
+      - id: 1
+  - name: cane_2
+    tags:
+      - id: 2
+  - name: cane_3
+    tags:
+      - id: 3
+  - name: cane_4
+    tags:
+      - id: 4
+  - name: cane_5
+    tags:
+      - id: 5
+
+# To keep one location visible from more sides, mount several tags on one rigid
+# holder and list them under a single object. Each tag then sets the transform
+# from the tag frame to the shared object frame:
+#   pos: translation from tag centre to object origin, in the tag frame (metres)
+#        Tag +z points into the tag, away from the camera viewing it.
+#   rot: 3x3 rotation of the object frame relative to the tag frame
+#
+# Two tags back to back on a 20 mm holder, with the origin at its centre:
+#  - name: cane_0
+#    tags:
+#      - id: 0
+#        pos: [0.0, 0.0, 0.01]
+#      - id: 6
+#        pos: [0.0, 0.0, 0.01]
+#        rot: [[-1, 0, 0], [0, 1, 0], [0, 0, -1]]
