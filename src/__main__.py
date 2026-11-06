@@ -9,11 +9,11 @@ from threading import Event
 import cv2
 from scipy.spatial.transform import Rotation as R
 
-from at_tracking import annotate
-from at_tracking.camera import RealSenseCamera, VideoRecorder
-from at_tracking.config import load_config
-from at_tracking.data_collector import DataCollector
-from at_tracking.detection import TagPipeline
+from src import annotate
+from src.camera import RealSenseCamera, VideoRecorder
+from src.config import load_config
+from src.data_collector import DataCollector
+from src.detection import TagPipeline
 
 ESCAPE_KEY = 27
 

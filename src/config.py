@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import yaml
 
-from at_tracking.tracker import Tracker
+from src.tracker import Tracker
 
 # Tolerant enough for hand-typed values such as 0.7071.
 ROTATION_TOLERANCE = 1e-3

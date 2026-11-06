@@ -12,8 +12,8 @@ decision_margin: 3.0
 reference_tag: null
 
 camera:
-  width: 1280
-  height: 720
+  width: 1920
+  height: 1080
   fps: 30         # 6, 15, or 30
   exposure: 100   # null leaves auto exposure on
 

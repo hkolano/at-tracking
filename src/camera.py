@@ -6,7 +6,7 @@ import cv2
 import numpy as np
 import pyrealsense2 as rs
 
-from at_tracking.config import CameraConfig
+from src.config import CameraConfig
 
 
 class RealSenseCamera:
