@@ -2,3 +2,4 @@ __pycache__/
 *.parquet
 *.mp4
 .venv/
+data/

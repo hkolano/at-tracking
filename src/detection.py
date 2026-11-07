@@ -53,6 +53,7 @@ class TagPipeline:
 
     @property
     def use_reference_frame(self):
+        """Return True when poses are expressed in the reference tag's frame."""
         return self.reference_id is not None
 
     def process_frame(self, frame):
@@ -61,7 +62,7 @@ class TagPipeline:
         Returns:
             dict of tag_id -> raw Detection (camera frame).
         """
-        tag_dict = self._detect_valid_tags(frame)
+        tag_dict = self.detect_tags(frame)
 
         if self.use_reference_frame and self.reference_id in tag_dict:
             self.last_reference_pose = tag_dict[self.reference_id]
@@ -72,7 +73,7 @@ class TagPipeline:
 
         return tag_dict
 
-    def _detect_valid_tags(self, frame):
+    def detect_tags(self, frame):
         """Run AprilTag detection and filter by ID and decision margin."""
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         raw_tags = self.detector.detect(

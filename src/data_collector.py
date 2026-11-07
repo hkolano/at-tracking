@@ -1,12 +1,13 @@
 """Collect tracked poses and write them to Parquet.
 
 Run directly to summarize a recording:
-    python -m at_tracking.data_collector tracking.parquet
+    python -m src.data_collector tracking.parquet
 """
 
 import argparse
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pandas as pd
 import pyarrow as pa
@@ -19,10 +20,12 @@ TRACKING_COLUMNS = ["timestamp", "name", "x", "y", "z", "qx", "qy", "qz", "qw"]
 class DataCollector:
 
     def __init__(self, metadata=None):
+        """Start with no rows and optional metadata for the Parquet footer."""
         self.rows = []
         self.metadata = dict(metadata or {})
 
     def update(self, timestamp, name, x, y, z, qx, qy, qz, qw):
+        """Add one pose row."""
         self.rows.append([timestamp, name, x, y, z, qx, qy, qz, qw])
 
     def dump(self, filename="output.parquet", metadata=None):
@@ -39,6 +42,7 @@ class DataCollector:
             file_metadata, sort_keys=True, default=str
         ).encode("utf-8")
         table = table.replace_schema_metadata(schema_metadata)
+        Path(filename).parent.mkdir(parents=True, exist_ok=True)
         pq.write_table(table, filename)
 
 

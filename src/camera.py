@@ -20,10 +20,11 @@ class RealSenseCamera:
         )
         profile = self.pipeline.start(stream_config)
 
-        if config.exposure is not None:
-            color_sensor = profile.get_device().query_sensors()[1]
-            color_sensor.set_option(rs.option.enable_auto_exposure, 0)
-            color_sensor.set_option(rs.option.exposure, config.exposure)
+        self.color_sensor = profile.get_device().query_sensors()[1]
+        if config.exposure is None:
+            self.set_auto_exposure(True)
+        else:
+            self.set_exposure(config.exposure)
 
         intrinsics = (
             profile.get_stream(rs.stream.color)
@@ -42,6 +43,24 @@ class RealSenseCamera:
         # D435 distortion is negligible at typical working distances.
         self.dist_coeffs = np.zeros(5, dtype=np.float32)
 
+    def exposure_range(self):
+        """Return the lowest and highest manual exposure the camera allows."""
+        option_range = self.color_sensor.get_option_range(rs.option.exposure)
+        return option_range.min, option_range.max
+
+    def current_exposure(self):
+        """Return the camera's current exposure setting."""
+        return self.color_sensor.get_option(rs.option.exposure)
+
+    def set_exposure(self, value):
+        """Turn auto exposure off and use a manual exposure."""
+        self.color_sensor.set_option(rs.option.enable_auto_exposure, 0)
+        self.color_sensor.set_option(rs.option.exposure, value)
+
+    def set_auto_exposure(self, enabled):
+        """Turn auto exposure on or off."""
+        self.color_sensor.set_option(rs.option.enable_auto_exposure, 1 if enabled else 0)
+
     def read(self):
         """Block until a color frame arrives; return it as a BGR array, or None."""
         color_frame = self.pipeline.wait_for_frames().get_color_frame()
@@ -50,6 +69,7 @@ class RealSenseCamera:
         return np.asanyarray(color_frame.get_data())
 
     def close(self):
+        """Stop the color stream."""
         self.pipeline.stop()
 
 

@@ -1,6 +1,7 @@
 numpy
 opencv-python==4.12.0.88  # 4.13 and later no longer bundle the fonts its window needs
 pandas
+pillow
 pupil_apriltags
 pyarrow
 pyrealsense2

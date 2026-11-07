@@ -12,6 +12,7 @@ COLOR_TRACKER_ORIGIN = (255, 255, 255)
 COLOR_TEXT = (255, 255, 255)
 COLOR_WAITING = (0, 0, 255)
 COLOR_MODE = (0, 255, 255)
+COLOR_TAG_NAME = (0, 255, 255)
 
 
 def reference_extrinsics(reference_pose):
@@ -62,6 +63,34 @@ def draw_reference_axes(frame, camera_matrix, dist_coeffs, rvec, tvec, axis_leng
         COLOR_TEXT,
         2,
     )
+
+
+def draw_tag_axes(
+    frame, tag_dict, camera_matrix, dist_coeffs, reference_id=None, names=None, axis_length=0.03
+):
+    """Draw outlines, names, and a coordinate frame on every detected tag."""
+    names = names or {}
+    camera_matrix = np.asarray(camera_matrix, dtype=np.float64)
+    dist_coeffs = np.asarray(dist_coeffs, dtype=np.float64)
+
+    draw_tag_outlines(frame, tag_dict)
+    for tag_id, tag in tag_dict.items():
+        rvec, tvec = reference_extrinsics(tag)
+        if tag_id == reference_id:
+            draw_reference_axes(frame, camera_matrix, dist_coeffs, rvec, tvec, axis_length)
+            continue
+
+        cv2.drawFrameAxes(frame, camera_matrix, dist_coeffs, rvec, tvec, axis_length, 2)
+        center_x, center_y = tag.center.astype(np.int32)
+        cv2.putText(
+            frame,
+            names.get(tag_id, f"tag_{tag_id}"),
+            (int(center_x) + 10, int(center_y) + 25),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            COLOR_TAG_NAME,
+            2,
+        )
 
 
 def draw_tracker_overlay(

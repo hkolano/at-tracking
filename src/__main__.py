@@ -1,4 +1,4 @@
-"""Record tracked object poses: python -m at_tracking --config config/example.yaml"""
+"""Record tracked object poses: python -m src --config config/example.yaml"""
 
 import argparse
 import signal
