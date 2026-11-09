@@ -9,6 +9,10 @@ import pyrealsense2 as rs
 from src.config import CameraConfig
 
 
+class CameraResetError(RuntimeError):
+    """The camera reset itself, so its settings are back to the factory defaults."""
+
+
 class RealSenseCamera:
     """Start the color stream and expose its intrinsics."""
 
@@ -21,6 +25,8 @@ class RealSenseCamera:
         profile = self.pipeline.start(stream_config)
 
         self.color_sensor = profile.get_device().query_sensors()[1]
+        self.auto_exposure_on = None  # Unknown until this object sets it.
+        self.last_frame_number = None
         if config.exposure is None:
             self.set_auto_exposure(True)
         else:
@@ -53,19 +59,37 @@ class RealSenseCamera:
         return self.color_sensor.get_option(rs.option.exposure)
 
     def set_exposure(self, value):
-        """Turn auto exposure off and use a manual exposure."""
-        self.color_sensor.set_option(rs.option.enable_auto_exposure, 0)
+        """Use a manual exposure, turning auto exposure off first if needed.
+
+        Each setting change is a command the camera must answer while streaming,
+        and a burst of them can make it stop responding, so none are sent twice.
+        """
+        if self.auto_exposure_on is not False:
+            self.set_auto_exposure(False)
         self.color_sensor.set_option(rs.option.exposure, value)
 
     def set_auto_exposure(self, enabled):
         """Turn auto exposure on or off."""
         self.color_sensor.set_option(rs.option.enable_auto_exposure, 1 if enabled else 0)
+        self.auto_exposure_on = bool(enabled)
 
     def read(self):
-        """Block until a color frame arrives; return it as a BGR array, or None."""
+        """Block until a color frame arrives; return it as a BGR array, or None.
+
+        Raises:
+            CameraResetError: The camera reset itself. Intel's library restarts the
+                stream on its own afterwards, but the camera is back on its default
+                settings and the settings handle here no longer works, so the camera
+                must be reopened. A reset shows up as the frame counter starting
+                again from zero.
+        """
         color_frame = self.pipeline.wait_for_frames().get_color_frame()
         if not color_frame:
             return None
+        frame_number = color_frame.get_frame_number()
+        if self.last_frame_number is not None and frame_number < self.last_frame_number:
+            raise CameraResetError("the camera reset itself and lost its settings")
+        self.last_frame_number = frame_number
         return np.asanyarray(color_frame.get_data())
 
     def close(self):

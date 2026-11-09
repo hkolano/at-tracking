@@ -6,6 +6,9 @@ Run from the repository root:
 
 import csv
 import json
+import os
+import subprocess
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +19,7 @@ import pyarrow.parquet as pq
 import pytest
 from scipy.spatial.transform import Rotation as R
 
+from src import capture
 from src.capture import CaptureWorker
 from src.config import CameraConfig, Config, TrackedObjectConfig
 from src.data_collector import DataCollector
@@ -52,10 +56,19 @@ class FakeCamera:
     """Serves a scripted sequence of frames, repeating the last one."""
 
     script = []
+    later_scripts = []  # Scripts for cameras opened after a reconnect, in order.
+    open_failures = 0   # Number of upcoming opens that fail, like an unplugged camera.
     exposure_error = None
+    instances = []
 
-    def __init__(self, _config):
-        """Set up intrinsics and start the script."""
+    def __init__(self, config):
+        """Set up intrinsics and start the script, or fail to open."""
+        if FakeCamera.open_failures > 0:
+            FakeCamera.open_failures -= 1
+            raise RuntimeError("No device connected")
+        self.config = config
+        self.script = FakeCamera.later_scripts.pop(0) if FakeCamera.instances and FakeCamera.later_scripts else FakeCamera.script
+        FakeCamera.instances.append(self)
         self.camera_params = (FOCAL, FOCAL, WIDTH / 2, HEIGHT / 2)
         self.K = np.array(
             [[FOCAL, 0, WIDTH / 2], [0, FOCAL, HEIGHT / 2], [0, 0, 1]], dtype=np.float32
@@ -118,13 +131,17 @@ def wait_for(condition, timeout=20.0):
 
 
 @pytest.fixture
-def worker(tmp_path):
+def worker(tmp_path, monkeypatch):
     """Yield a worker factory, stopping whatever it starts."""
     started = []
+    monkeypatch.setattr(capture, "RECONNECT_DELAY_SECONDS", 0.05)
 
-    def make(script, reference=2, exposure=100):
+    def make(script, reference=2, exposure=100, later_scripts=(), open_failures=0):
         """Start a worker on a scripted camera."""
         FakeCamera.script = script
+        FakeCamera.later_scripts = list(later_scripts)
+        FakeCamera.open_failures = open_failures
+        FakeCamera.instances = []
         FakeCamera.exposure_error = None
         result = CaptureWorker(
             make_config(exposure), output_dir=tmp_path, camera_factory=FakeCamera
@@ -313,17 +330,131 @@ def test_stop_during_recording_discards_and_releases_camera(worker, tmp_path):
     live.stop()
 
     assert not list(tmp_path.iterdir())
-    assert FakeCamera.instance.closed
+    assert FakeCamera.instances[-1].closed
 
 
-def test_camera_failure_is_reported(worker):
-    """A camera error reaches the GUI as a fatal notice and releases the camera."""
-    live = worker([{0: (300, 200)}, RuntimeError("Frame didn't arrive")])
-    wait_for(lambda: not live._thread.is_alive())
+def test_lost_camera_reconnects(worker):
+    """A camera error is reported, the camera is reopened, and frames resume."""
+    live = worker(
+        [{0: (300, 200)}] * 3 + [RuntimeError("Frame didn't arrive")],
+        later_scripts=[[{0: (300, 200), 2: (600, 500)}]],
+    )
+    wait_for(lambda: len(FakeCamera.instances) == 2 and live.get_state() is not None
+             and 2 in live.get_state().visible_ids)
 
-    notices = live.get_notices()
-    assert any(notice.is_fatal and "Frame didn't arrive" in notice.text for notice in notices)
-    assert FakeCamera.instance.closed
+    texts = [notice.text for notice in live.get_notices()]
+    assert any("Camera lost" in text and "Frame didn't arrive" in text for text in texts)
+    assert "Camera reconnected." in texts
+    assert FakeCamera.instances[0].closed and live.is_connected()
+
+
+def test_reconnect_keeps_exposure(worker):
+    """The reopened camera gets the exposure that was in use, not the config's."""
+    live = worker([{0: (300, 200)}], later_scripts=[[{0: (300, 200)}]])
+    wait_for(lambda: live.get_state() is not None)
+    live.set_exposure(400)
+    wait_for(lambda: live.get_state().exposure == 400)
+
+    FakeCamera.instances[0].script = [RuntimeError("Frame didn't arrive")]
+    FakeCamera.instances[0].index = 0
+    wait_for(lambda: len(FakeCamera.instances) == 2 and live.is_connected())
+    assert FakeCamera.instances[1].config.exposure == 400
+
+    live.set_auto_exposure(True)
+    wait_for(lambda: live.get_state().auto_exposure)
+    FakeCamera.instances[1].script = [RuntimeError("Frame didn't arrive")]
+    FakeCamera.instances[1].index = 0
+    FakeCamera.later_scripts = [[{0: (300, 200)}]]
+    wait_for(lambda: len(FakeCamera.instances) == 3 and live.is_connected())
+    assert FakeCamera.instances[2].config.exposure is None
+
+
+def test_recording_discarded_when_camera_lost(worker, tmp_path):
+    """A recording cut short by a lost camera saves nothing, and recording can resume."""
+    both = {0: (300, 200), 2: (600, 500)}
+    live = worker([both], later_scripts=[[both]])
+    wait_for(lambda: live.get_state() is not None)
+    live.start_recording(60, "1", "1")
+    wait_for(lambda: live.get_state().recording_remaining is not None)
+
+    FakeCamera.instances[0].script = [RuntimeError("Frame didn't arrive")]
+    FakeCamera.instances[0].index = 0
+    wait_for(lambda: not live.is_recording() and len(FakeCamera.instances) == 2)
+
+    assert not list(tmp_path.iterdir())
+    assert any("discarded" in notice.text for notice in live.get_notices())
+    wait_for(live.is_connected)
+    live.start_recording(0.2, "1", "1")
+    wait_for(lambda: list(tmp_path.glob("*.png")))
+
+
+def test_waits_for_missing_camera_and_reports_once(worker):
+    """A camera that isn't plugged in yet is retried, with one message."""
+    live = worker([{0: (300, 200)}], open_failures=5)
+    wait_for(lambda: live.get_state() is not None)
+
+    texts = [notice.text for notice in live.get_notices()]
+    assert sum("Waiting for camera" in text for text in texts) == 1
+    assert "Camera connected." in texts
+
+
+def test_stop_while_waiting_for_camera_is_quick(worker, monkeypatch):
+    """Closing the GUI doesn't wait out the retry delay."""
+    monkeypatch.setattr(capture, "RECONNECT_DELAY_SECONDS", 30)
+    live = worker([{0: (300, 200)}], open_failures=1000)
+    wait_for(lambda: live.get_notices())
+    started = time.monotonic()
+    live.stop()
+    assert time.monotonic() - started < 2 and not live._thread.is_alive()
+
+
+def test_unchanged_exposure_sends_no_command(worker):
+    """Repeating the current exposure, or auto when already auto, sends nothing."""
+    live = worker([{0: (300, 200)}])
+    wait_for(lambda: live.get_state() is not None)
+    live.set_exposure(100)
+    live.set_auto_exposure(False)
+    current = live.get_state().sequence
+    wait_for(lambda: live.get_state().sequence > current + 2)
+    assert FakeCamera.instances[0].exposure_calls == []
+
+
+def test_camera_skips_redundant_auto_exposure_command():
+    """Changing manual exposure doesn't resend 'auto exposure off' each time."""
+    import pyrealsense2 as rs
+    from src.camera import RealSenseCamera
+
+    class Sensor:
+        """Records the options set on it."""
+
+        def __init__(self):
+            """Start with no calls."""
+            self.calls = []
+
+        def set_option(self, option, value):
+            """Record one option change."""
+            self.calls.append((option, value))
+
+    camera = RealSenseCamera.__new__(RealSenseCamera)
+    camera.color_sensor = Sensor()
+    camera.auto_exposure_on = None
+
+    camera.set_exposure(100)
+    camera.set_exposure(200)
+    camera.set_exposure(300)
+    camera.set_auto_exposure(True)
+    camera.set_exposure(400)
+
+    auto_off = (rs.option.enable_auto_exposure, 0)
+    assert camera.color_sensor.calls == [
+        auto_off,
+        (rs.option.exposure, 100),
+        (rs.option.exposure, 200),
+        (rs.option.exposure, 300),
+        (rs.option.enable_auto_exposure, 1),
+        auto_off,
+        (rs.option.exposure, 400),
+    ]
 
 
 def test_save_failure_is_reported_and_worker_continues(worker, tmp_path):
@@ -377,6 +508,7 @@ def test_rolling_median_ages_out_and_clears():
 def test_display_is_filtered_but_recorded_rows_stay_raw():
     """A flipped frame is absent from the display and kept in the Parquet rows."""
     live = CaptureWorker(make_config(), camera_factory=FakeCamera)
+    FakeCamera.instances = []
     live._camera = FakeCamera(None)
     reference = FakePose(np.eye(3), [0, 0, 1])
     live._recording = type("Recording", (), {})()
@@ -441,14 +573,14 @@ def test_exposure_requests_apply_on_worker(worker):
     live.set_exposure(200)
     live.set_exposure(300)
     wait_for(lambda: live.get_state().exposure == 300)
-    assert FakeCamera.instance.exposure_calls == [("manual", 300)]
+    assert FakeCamera.instances[-1].exposure_calls == [("manual", 300)]
 
     live.set_auto_exposure(True)
     wait_for(lambda: live.get_state().auto_exposure)
     live.set_auto_exposure(False)
     wait_for(lambda: not live.get_state().auto_exposure)
     assert live.get_state().exposure == 300
-    assert FakeCamera.instance.exposure_calls[-1] == ("manual", 300)
+    assert FakeCamera.instances[-1].exposure_calls[-1] == ("manual", 300)
 
 
 def test_exposure_ignored_during_recording(worker, tmp_path):
@@ -463,20 +595,22 @@ def test_exposure_ignored_during_recording(worker, tmp_path):
     wait_for(lambda: live.get_state().sequence > current + 2)
 
     assert live.get_state().exposure == 100
-    assert FakeCamera.instance.exposure_calls == []
+    assert FakeCamera.instances[-1].exposure_calls == []
 
 
-def test_exposure_failure_keeps_camera_running(worker):
-    """A rejected exposure is reported, and frames keep coming."""
-    live = worker([{0: (300, 200)}])
+def test_exposure_failure_reopens_camera(worker):
+    """A rejected exposure change reopens the camera at the last exposure that worked."""
+    live = worker([{0: (300, 200)}], later_scripts=[[{0: (300, 200)}]])
     wait_for(lambda: live.get_state() is not None)
-    FakeCamera.instance.exposure_error = RuntimeError("option rejected")
+    FakeCamera.instances[0].exposure_error = RuntimeError("option rejected")
     live.set_exposure(500)
-    wait_for(lambda: any("option rejected" in n.text for n in live.get_notices()))
+    wait_for(lambda: len(FakeCamera.instances) == 2 and live.is_connected())
 
+    assert any("option rejected" in n.text and "Reconnecting" in n.text for n in live.get_notices())
+    assert FakeCamera.instances[1].config.exposure == 100
     current = live.get_state().sequence
     wait_for(lambda: live.get_state().sequence > current)
-    assert live.get_state().exposure == 100 and not FakeCamera.instance.closed
+    assert live.get_state().exposure == 100
 
 
 def test_auto_config_reports_camera_exposure(worker):
@@ -526,3 +660,112 @@ def test_tags_not_in_config_are_ignored(worker, tmp_path):
     assert read_rows(single_file(tmp_path, "*_average.csv"))[0]["tag_id"] == "0"
     frames = pq.read_table(single_file(tmp_path, "*_frames.parquet")).to_pandas()
     assert set(frames["name"]) == {"cane_0", "cane_2"}
+
+
+def test_stop_reports_whether_camera_was_released(worker):
+    """stop() says whether the camera thread finished in time."""
+    healthy = worker([{0: (300, 200)}])
+    wait_for(lambda: healthy.get_state() is not None)
+    assert healthy.stop() is True
+
+    stuck = worker([{0: (300, 200)}])
+    wait_for(lambda: stuck.get_state() is not None)
+    FakeCamera.instances[-1].read = lambda: time.sleep(5)  # A camera that stops answering.
+    time.sleep(0.1)
+    started = time.monotonic()
+    assert stuck.stop(timeout=0.3) is False
+    assert time.monotonic() - started < 1
+
+
+CLOSE_SCRIPT = """
+import sys, threading, time
+sys.path.insert(0, {root!r})
+sys.path.insert(0, {tests!r})
+import tkinter as tk
+import test_measurement as t
+from src import gui
+from src.capture import CaptureWorker
+
+gui.CAMERA_RELEASE_SECONDS = 0.5
+t.FakeCamera.script = [{{0: (300, 200)}}]
+if {stuck}:
+    t.FakeCamera.read = lambda self: time.sleep(1000)  # The camera stops answering.
+worker = CaptureWorker(t.make_config(), camera_factory=t.FakeCamera)
+root = tk.Tk()
+app = gui.TrackerApp(root, worker)
+worker.start()
+root.after(1500, app.close)
+root.mainloop()
+# Without a forced exit, this thread would keep the process alive, as a stuck camera does.
+threading.Thread(target=time.sleep, args=(1000,)).start()
+gui.exit_if_camera_stuck(app)
+print("closed normally", flush=True)
+"""
+
+
+@pytest.mark.skipif(not os.environ.get("DISPLAY"), reason="needs a display for the window")
+@pytest.mark.parametrize("stuck", [False, True])
+def test_closing_window_with_stuck_camera_ends_program(stuck, tmp_path):
+    """Closing the window ends the program even when the camera never answers."""
+    root = Path(__file__).resolve().parents[1]
+    script = tmp_path / "close.py"
+    script.write_text(CLOSE_SCRIPT.format(root=str(root), tests=str(root / "utils"), stuck=stuck))
+
+    process = subprocess.Popen(
+        [sys.executable, str(script)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+    if stuck:
+        _, errors = process.communicate(timeout=20)
+        assert process.returncode == 1
+        assert "unplug the camera" in errors
+    else:
+        # A healthy camera closes normally; the extra thread then keeps it open, so stop it.
+        time.sleep(4)
+        assert process.poll() is None
+        process.kill()
+        output, _ = process.communicate()
+        assert "closed normally" in output
+
+
+def test_camera_detects_its_own_reset():
+    """A frame counter that starts again from zero means the camera reset itself."""
+    from src.camera import CameraResetError, RealSenseCamera
+
+    class Frame:
+        """A color frame with a frame number."""
+
+        def __init__(self, number):
+            """Store the frame number."""
+            self.number = number
+
+        def __bool__(self):
+            """Behave like a valid frame."""
+            return True
+
+        def get_frame_number(self):
+            """Return the frame number."""
+            return self.number
+
+        def get_data(self):
+            """Return a tiny image."""
+            return np.zeros((2, 2, 3), np.uint8)
+
+    class Pipeline:
+        """Serves frames with the given numbers."""
+
+        def __init__(self, numbers):
+            """Store the frame numbers to serve."""
+            self.numbers = iter(numbers)
+
+        def wait_for_frames(self):
+            """Return the next frame set."""
+            frame = Frame(next(self.numbers))
+            return type("Frames", (), {"get_color_frame": lambda _self: frame})()
+
+    camera = RealSenseCamera.__new__(RealSenseCamera)
+    camera.pipeline = Pipeline([5, 6, 7, 0])
+    camera.last_frame_number = None
+    for _ in range(3):
+        camera.read()
+    with pytest.raises(CameraResetError):
+        camera.read()

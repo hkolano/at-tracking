@@ -4,6 +4,12 @@ import cv2
 import numpy as np
 from pupil_apriltags import Detector
 
+# pupil_apriltags 1.0.4 can crash the whole process (segmentation fault) when a
+# detector that used more than one thread is destroyed, for example when the GUI
+# closes. In testing, 2, 4 and 12 threads all crashed and 1 thread never did. One
+# thread takes about 74 ms per 1080p frame instead of about 43 ms with 12.
+DETECTOR_THREADS = 1
+
 
 class TagPipeline:
     """Detect tags in a frame and update trackers.
@@ -45,7 +51,7 @@ class TagPipeline:
         self.detector = Detector(
             families=tag_family,
             quad_decimate=1.0,
-            nthreads=12,
+            nthreads=DETECTOR_THREADS,
             refine_edges=1,
             quad_sigma=0.2,
             decode_sharpening=1.0,

@@ -22,10 +22,19 @@ python -m src.gui --config config/example.yaml
 1. Choose a reference tag. The table shows live x, y, z of every other tag in that
    tag's frame.
 2. Adjust **Exposure** until all the tags are detected, or tick **Auto**. Changes
-   last until you close the window; the starting value comes from the config.
+   last until you close the window; the starting value comes from the config. The
+   camera is updated 0.3 s after the slider stops moving, not during a drag.
 3. Enter the **Bush ID** and **Cane ID**, and set the recording length in seconds.
 4. Press **Record**, which is available while the reference tag is visible and both
    IDs are filled in.
+
+If the camera disconnects, the GUI keeps trying to reopen it every 2 seconds, using
+the same exposure. A recording in progress at the time is discarded.
+
+If the camera stops responding without disconnecting, it needs unplugging and
+plugging back in. Closing the window still ends the program in that case: if the
+camera isn't released within 10 seconds, the program ends itself so the camera is
+freed.
 
 The table shows a 1 second rolling median, so it's easier to read. A hidden tag keeps
 its value until it has been out of view for over 1 second. Only the display is

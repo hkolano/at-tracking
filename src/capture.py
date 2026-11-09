@@ -8,7 +8,7 @@ import queue
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -31,6 +31,8 @@ from src.measurement import (
 # Warn when more than this share of a tag's frames were dropped as flips.
 REJECTED_WARNING_FRACTION = 0.2
 FPS_WINDOW_FRAMES = 30
+# Wait between attempts to reopen a lost camera.
+RECONNECT_DELAY_SECONDS = 2.0
 
 
 @dataclass(frozen=True)
@@ -56,7 +58,6 @@ class Notice:
 
     text: str
     is_error: bool = False
-    is_fatal: bool = False
 
 
 @dataclass
@@ -120,16 +121,25 @@ class CaptureWorker:
 
         self._camera = None
         self._pipeline = None
+        self._connected = False
+        self._ever_connected = False
+        self._open_failure_reported = False
 
     def start(self):
         """Start the background thread."""
         self._thread.start()
 
     def stop(self, timeout=10.0):
-        """Stop the thread and release the camera. A running recording is discarded."""
+        """Stop the thread and release the camera. A running recording is discarded.
+
+        Returns:
+            True if the thread finished, False if it was still stuck after the
+            timeout, which happens when the camera has stopped responding.
+        """
         self._stop_requested.set()
         if self._thread.is_alive():
             self._thread.join(timeout)
+        return not self._thread.is_alive()
 
     def set_reference(self, tag_id):
         """Set the reference tag. A running recording keeps its original reference."""
@@ -161,6 +171,11 @@ class CaptureWorker:
             if self._recording_request is None and self._recording is None:
                 self._recording_request = (float(seconds), bush_id, cane_id)
 
+    def is_connected(self):
+        """Return True while the camera is open and delivering frames."""
+        with self._lock:
+            return self._connected
+
     def is_recording(self):
         """Return True while a recording is requested or running."""
         with self._lock:
@@ -181,9 +196,26 @@ class CaptureWorker:
                 return notices
 
     def _run(self):
-        """Open the camera, process frames until stopped, then release the camera."""
-        try:
-            self._camera = self.camera_factory(self.config.camera)
+        """Process frames until stopped, reopening the camera whenever it is lost."""
+        while not self._stop_requested.is_set():
+            try:
+                self._open_camera()
+                while not self._stop_requested.is_set():
+                    self._apply_exposure_request()
+                    frame = self._camera.read()
+                    if frame is not None:
+                        self._process_frame(frame)
+            except Exception as error:  # Reported, then the camera is reopened.
+                self._report_camera_error(error)
+            finally:
+                self._close_camera()
+            self._stop_requested.wait(RECONNECT_DELAY_SECONDS)
+
+    def _open_camera(self):
+        """Open the camera with the current exposure and prepare the detector."""
+        exposure = None if self._auto_exposure else self._exposure
+        self._camera = self.camera_factory(replace(self.config.camera, exposure=exposure))
+        if self._pipeline is None:
             # Only tags listed in the config are accepted, which rules out false detections.
             self._pipeline = TagPipeline(
                 self.config.build_trackers(),
@@ -193,18 +225,41 @@ class CaptureWorker:
                 decision_margin=self.config.decision_margin,
                 reference_id=self.config.reference_tag,
             )
-            self._exposure_range = self._camera.exposure_range()
-            if self._exposure is None:
-                self._exposure = self._camera.current_exposure()
-            while not self._stop_requested.is_set():
-                self._apply_exposure_request()
-                frame = self._camera.read()
-                if frame is not None:
-                    self._process_frame(frame)
-        except Exception as error:  # Shown in the GUI instead of ending silently.
-            self._notices.put(Notice(f"Camera stopped: {error}", is_error=True, is_fatal=True))
-        finally:
-            self._close_camera()
+        else:
+            # The same camera comes back, so the existing detector is reused.
+            self._pipeline.camera_params = self._camera.camera_params
+        self._exposure_range = self._camera.exposure_range()
+        if self._exposure is None:
+            self._exposure = self._camera.current_exposure()
+
+        if self._ever_connected:
+            self._notices.put(Notice("Camera reconnected."))
+        elif self._open_failure_reported:
+            self._notices.put(Notice("Camera connected."))
+        self._ever_connected = True
+        self._open_failure_reported = False
+        with self._lock:
+            self._connected = True
+
+    def _report_camera_error(self, error):
+        """Tell the GUI the camera was lost, discarding any recording in progress."""
+        with self._lock:
+            was_connected = self._connected
+            had_recording = self._recording is not None or self._recording_request is not None
+            self._connected = False
+            self._recording = None
+            self._recording_request = None
+
+        if was_connected:
+            self._notices.put(Notice(f"Camera lost ({error}). Reconnecting...", is_error=True))
+        elif not self._open_failure_reported:
+            # Repeated failures to open are reported once, not every attempt.
+            self._open_failure_reported = True
+            self._notices.put(Notice(f"Waiting for camera ({error}). Retrying...", is_error=True))
+        if had_recording:
+            self._notices.put(
+                Notice("The recording was discarded because the camera was lost.", is_error=True)
+            )
 
     def _apply_exposure_request(self):
         """Apply the newest exposure request from the capture thread."""
@@ -216,25 +271,31 @@ class CaptureWorker:
 
         auto, value = request
         value = self._exposure if value is None else value
+        if auto == self._auto_exposure and (auto or value == self._exposure):
+            return  # Already set, so don't send the camera a command it doesn't need.
         try:
             if auto:
                 self._camera.set_auto_exposure(True)
             else:
                 self._camera.set_exposure(value)
-        except Exception as error:  # Tracking can continue at the old exposure.
-            self._notices.put(Notice(f"Could not change exposure: {error}", is_error=True))
-            return
+        except Exception as error:
+            # A camera that rejects a setting change has usually stopped responding or
+            # been reset, so it is reopened, keeping the last exposure that worked.
+            raise RuntimeError(f"could not change exposure: {error}") from error
         self._auto_exposure = auto
         self._exposure = value
 
     def _close_camera(self):
-        """Release the camera, reporting any failure."""
+        """Release the camera. Errors are ignored, as a lost camera often can't close cleanly."""
+        with self._lock:
+            self._connected = False
         if self._camera is None:
             return
         try:
             self._camera.close()
-        except Exception as error:
-            self._notices.put(Notice(f"Could not close camera: {error}", is_error=True))
+        except Exception:
+            pass
+        self._camera = None
 
     def _process_frame(self, frame):
         """Detect tags, update any recording, and publish the display state."""

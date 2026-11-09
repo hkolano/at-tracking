@@ -6,6 +6,8 @@ Run from the repository root:
 
 import argparse
 import math
+import os
+import sys
 import tkinter as tk
 from tkinter import ttk
 
@@ -17,6 +19,13 @@ from src.config import load_config
 from src.measurement import DISPLAY_FILTER_SECONDS, clean_id
 
 POLL_MILLISECONDS = 30
+# Wait this long after the slider stops moving before changing the camera's exposure.
+# Sending a change for every step of a drag can make the camera stop responding.
+EXPOSURE_SEND_DELAY_MILLISECONDS = 300
+# How long closing the window waits for the camera to be released. A camera that
+# has stopped responding can block Intel's library for minutes, so after this the
+# program ends itself rather than staying open in the background.
+CAMERA_RELEASE_SECONDS = 10.0
 DEFAULT_SECONDS = 5
 COLOR_ERROR = "#b3261e"
 COLOR_NORMAL = "#1f1f1f"
@@ -42,8 +51,10 @@ class TrackerApp:
         """Build the window and start polling the worker."""
         self.root = root
         self.worker = worker
-        self.camera_failed = False
         self.last_sequence = 0
+        self.exposure_job = None  # Pending slider change, sent once the slider settles.
+        self.camera_released = True
+        self.was_connected = False
         self.photo = None  # Tk only shows an image while a reference to it exists.
         self.rows = {}     # tag_id -> table row
         self.exposure_ready = False
@@ -142,18 +153,43 @@ class TrackerApp:
         self.worker.set_reference(int(self.reference_box.get()))
 
     def _on_exposure_slider(self, position):
-        """Send the slider's exposure to the worker."""
+        """Show the slider's exposure, and send it once the slider stops moving."""
         low, high = self.worker.get_state().exposure_range
         exposure = slider_to_exposure(float(position), low, high)
         self.exposure_label.configure(text=str(exposure))
+        self._cancel_exposure_send()
+        self.exposure_job = self.root.after(
+            EXPOSURE_SEND_DELAY_MILLISECONDS, self._send_exposure, exposure
+        )
+
+    def _send_exposure(self, exposure):
+        """Send a settled slider value to the worker."""
+        self.exposure_job = None
         self.worker.set_exposure(exposure)
+
+    def _cancel_exposure_send(self):
+        """Drop a slider change that hasn't been sent yet."""
+        if self.exposure_job is not None:
+            self.root.after_cancel(self.exposure_job)
+            self.exposure_job = None
+
+    def _flush_exposure_send(self):
+        """Send a slider change that hasn't been sent yet, straight away."""
+        if self.exposure_job is not None:
+            self._cancel_exposure_send()
+            low, high = self.worker.get_state().exposure_range
+            self.worker.set_exposure(slider_to_exposure(float(self.exposure_scale.get()), low, high))
 
     def _on_auto_exposure(self):
         """Send the Auto checkbox's value to the worker."""
+        # A late slider change would otherwise turn auto exposure back off.
+        self._cancel_exposure_send()
         self.worker.set_auto_exposure(self.auto_exposure.get())
 
     def _on_record(self):
         """Validate the recording length and start a recording."""
+        # Exposure changes are ignored once recording starts, so send any pending one first.
+        self._flush_exposure_send()
         try:
             seconds = float(self.seconds_box.get())
             self.worker.start_recording(seconds, self.bush_entry.get(), self.cane_entry.get())
@@ -171,6 +207,7 @@ class TrackerApp:
         """Show the worker's latest results, then schedule the next poll."""
         self._show_notices()
         state = self.worker.get_state()
+        self._show_connection(state)
         if state is not None and state.sequence != self.last_sequence:
             self.last_sequence = state.sequence
             self._show_frame(state.frame)
@@ -186,11 +223,23 @@ class TrackerApp:
         notices = self.worker.get_notices()
         if not notices:
             return
-        self.camera_failed = self.camera_failed or any(notice.is_fatal for notice in notices)
         has_error = any(notice.is_error for notice in notices)
         self._set_status("  ".join(notice.text for notice in notices), is_error=has_error)
-        if self.camera_failed:
-            self.canvas.itemconfigure(self.canvas_text, text="Camera unavailable.")
+
+    def _show_connection(self, state):
+        """Hide the last frame and say so while the camera is disconnected."""
+        connected = self.worker.is_connected()
+        if connected and not self.was_connected:
+            # Match the exposure controls to the camera again, as a failed change may
+            # have left them showing a value the camera isn't using.
+            self.exposure_ready = False
+        self.was_connected = connected
+        if connected:
+            self.canvas.itemconfigure(self.canvas_image, state="normal")
+            return
+        message = "Starting camera..." if state is None else "Camera disconnected. Reconnecting..."
+        self.canvas.itemconfigure(self.canvas_image, state="hidden")
+        self.canvas.itemconfigure(self.canvas_text, text=message)
 
     def _show_frame(self, frame):
         """Scale a BGR frame to fit the canvas and display it."""
@@ -236,8 +285,9 @@ class TrackerApp:
             return
         self.exposure_ready = True
         low, high = state.exposure_range
-        # Set before attaching the command, so this doesn't send a change.
-        self.exposure_scale.configure(state="normal")
+        # Set with no command attached, so this doesn't send a change.
+        self._cancel_exposure_send()
+        self.exposure_scale.configure(state="normal", command="")
         self.exposure_scale.set(exposure_to_slider(state.exposure, low, high))
         self.exposure_scale.configure(command=self._on_exposure_slider)
         self.exposure_label.configure(text=str(round(state.exposure)))
@@ -284,12 +334,13 @@ class TrackerApp:
             and state.reference_id in state.visible_ids
         )
         ids_entered = clean_id(self.bush_entry.get()) and clean_id(self.cane_entry.get())
-        can_record = reference_visible and ids_entered and not recording and not self.camera_failed
+        connected = self.worker.is_connected()
+        can_record = reference_visible and ids_entered and not recording and connected
         self.record_button.configure(state="normal" if can_record else "disabled")
         self.reference_box.configure(state="disabled" if recording else "readonly")
         self.hint.configure(text=self._hint_text(state))
 
-        exposure_locked = recording or self.camera_failed or not self.exposure_ready
+        exposure_locked = recording or not connected or not self.exposure_ready
         self.auto_check.configure(state="disabled" if exposure_locked else "normal")
         scale_locked = exposure_locked or self.auto_exposure.get()
         self.exposure_scale.configure(state="disabled" if scale_locked else "normal")
@@ -304,7 +355,8 @@ class TrackerApp:
 
     def close(self):
         """Stop the camera and close the window."""
-        self.worker.stop()
+        self._cancel_exposure_send()
+        self.camera_released = self.worker.stop(timeout=CAMERA_RELEASE_SECONDS)
         self.root.destroy()
 
 
@@ -317,9 +369,29 @@ def main():
 
     worker = CaptureWorker(load_config(args.config), output_dir=args.output_dir)
     root = tk.Tk()
-    TrackerApp(root, worker)
+    app = TrackerApp(root, worker)
     worker.start()
     root.mainloop()
+    exit_if_camera_stuck(app)
+
+
+def exit_if_camera_stuck(app):
+    """End the program at once if closing the window couldn't release the camera.
+
+    A normal exit would wait on the stuck camera thread, possibly for minutes,
+    while still holding the camera. Ending the process makes the operating system
+    release it. Recordings are always fully saved before the window can close.
+    """
+    if app.camera_released:
+        return
+    print(
+        "The camera did not respond while closing, so the program was ended to release it. "
+        "If it happens again, unplug the camera and plug it back in.",
+        file=sys.stderr,
+    )
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(1)
 
 
 if __name__ == "__main__":
