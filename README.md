@@ -51,6 +51,15 @@ flips. A colour only changes once the new one has lasted 1 second. **Record** ne
 the reference row to be green. All of these limits are constants at the top of
 [src/gui.py](src/gui.py).
 
+**Recorded?** keeps track of which tags have been captured for the current cane, so
+a cane can be covered over several recordings. After each recording, a tag gets a
+checkmark if it was green over that whole recording and has a row in the CSV.
+Checked rows are greyed out. If the reference wasn't green during the recording,
+nothing is checked off. The status bar says which tags were checked off and why the
+others weren't. Once every tag seen so far is checked, a green message says so. **New cane** clears
+the checkmarks and the Cane ID, after asking for confirmation.
+Checkmarks aren't saved, so they reset when the GUI closes.
+
 The table shows a 1 second rolling median, so it's easier to read. A hidden tag keeps
 its value until it has been out of view for over 1 second. Only the display is
 filtered; nothing in the saved files is.
@@ -72,10 +81,26 @@ tag sizes, camera settings, decision margin, and display names, while multi-tag
 objects and their offsets aren't applied.
 
 CSV columns are `bush_id, cane_id, timestamp, reference_id, tag_id, name, x, y, z, qx, qy, qz, qw,
-n_frames, n_rejected, pos_std_mm`, in metres with xyzw quaternions. Only frames
-showing both the tag and the reference are averaged. Frames whose rotation is more
-than 15 degrees from the tag's typical rotation are dropped first, and `n_rejected`
-counts them. `pos_std_mm` is the largest per-axis standard deviation.
+n_frames, n_rejected, pos_std_mm, detected_pct, flipped_pct, jitter_mm, well_detected`,
+in metres with xyzw quaternions. Only frames showing both the tag and the reference
+are averaged. Frames whose rotation is more than 15 degrees from the tag's typical
+rotation are dropped first, and `n_rejected` counts them. `pos_std_mm` is the
+largest per-axis standard deviation.
+
+The last four columns describe how well the tag was detected over the recording, in
+the camera frame, using the same measures as the GUI's row colours:
+
+| Column | Meaning |
+|---|---|
+| `detected_pct` | Share of the recording's frames that included the tag |
+| `flipped_pct` | Share of those detections that were orientation flips |
+| `jitter_mm` | Robust spread of position on the worst axis, after removing flips |
+| `well_detected` | `True` if the tag and the reference were both green over the recording, the same rule as the GUI's checkmark |
+
+Filter on `well_detected` to keep only reliable rows. The Parquet metadata records
+the limits used (`quality_limits`), the well-detected tag IDs, and these measures
+for every tag seen, including the reference. CSVs saved before this change don't
+have these columns.
 
 ### A larger reference tag
 

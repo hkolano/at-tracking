@@ -3,7 +3,7 @@
 import csv
 import re
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -19,7 +19,12 @@ CSV_COLUMNS = [
     "bush_id", "cane_id", "timestamp", "reference_id", "tag_id", "name",
     "x", "y", "z", "qx", "qy", "qz", "qw",
     "n_frames", "n_rejected", "pos_std_mm",
+    "detected_pct", "flipped_pct", "jitter_mm", "well_detected",
 ]
+
+STATUS_GOOD = "good"
+STATUS_FAIR = "fair"
+STATUS_NONE = "none"
 
 
 @dataclass(frozen=True)
@@ -146,6 +151,101 @@ class DetectionQuality:
         )
 
 
+@dataclass(frozen=True)
+class QualityLimits:
+    """Limits for judging a tag's detection. See the constants at the top of gui.py."""
+
+    min_detected: float = 0.20         # below this share of frames: not detected
+    green_min_detected: float = 0.70   # share of frames
+    green_max_flipped: float = 0.15    # share of detections
+    green_max_jitter_mm: float = 10.0
+    not_seen_seconds: float = 1.0      # live view only; ignored for whole recordings
+
+
+def judge_quality(quality, limits):
+    """Return (status, text) for a TagQuality, or for None if the tag isn't detected.
+
+    The text is short enough for the GUI table: the jitter when the tag is good, or
+    what keeps it from being good.
+    """
+    if (
+        quality is None
+        or quality.seconds_since_seen > limits.not_seen_seconds
+        or quality.detected_fraction < limits.min_detected
+    ):
+        return STATUS_NONE, ""
+
+    problems = []
+    if quality.detected_fraction < limits.green_min_detected:
+        problems.append(f"seen {quality.detected_fraction:.0%}")
+    if quality.flip_fraction > limits.green_max_flipped:
+        problems.append(f"flips {quality.flip_fraction:.0%}")
+    if quality.jitter_mm is None:
+        problems.append("few frames")
+    elif quality.jitter_mm > limits.green_max_jitter_mm:
+        problems.append(f"jitter {quality.jitter_mm:.0f} mm")
+
+    if problems:
+        return STATUS_FAIR, ", ".join(problems)
+    return STATUS_GOOD, f"good, {quality.jitter_mm:.0f} mm"
+
+
+@dataclass(frozen=True)
+class RecordingVerdict:
+    """Which tags a recording captured well enough to use."""
+
+    well_detected: frozenset  # tags green over the recording, with a green reference
+    problems: dict            # tag_id -> why it wasn't good enough, for tags in the CSV
+    reference_problem: str    # why the reference wasn't good enough, or ""
+
+
+def judge_recording(quality, reference_id, averaged_ids, limits):
+    """Decide which tags in a recording's CSV were well detected.
+
+    Each tag is judged over the whole recording, so how recently it was seen
+    doesn't matter. Nothing counts if the reference itself wasn't green.
+
+    Args:
+        quality:      dict of tag_id -> TagQuality over the whole recording.
+        reference_id: Reference tag ID.
+        averaged_ids: Tags with a row in the CSV.
+        limits:       QualityLimits.
+    """
+    def judge(tag_id):
+        """Judge one tag over the recording."""
+        tag_quality = quality.get(tag_id)
+        if tag_quality is not None:
+            tag_quality = replace(tag_quality, seconds_since_seen=0.0)
+        status, text = judge_quality(tag_quality, limits)
+        return status, text or "rarely seen"
+
+    reference_status, reference_text = judge(reference_id)
+    if reference_status != STATUS_GOOD:
+        return RecordingVerdict(frozenset(), {}, reference_text)
+
+    good, problems = set(), {}
+    for tag_id in sorted(averaged_ids):
+        status, text = judge(tag_id)
+        if status == STATUS_GOOD:
+            good.add(tag_id)
+        else:
+            problems[tag_id] = text
+    return RecordingVerdict(frozenset(good), problems, "")
+
+
+def quality_columns(quality, well_detected):
+    """Return the CSV's detected_pct, flipped_pct, jitter_mm and well_detected values."""
+    if quality is None:
+        return ["", "", "", well_detected]
+    jitter = "" if quality.jitter_mm is None else f"{quality.jitter_mm:.2f}"
+    return [
+        f"{quality.detected_fraction * 100:.1f}",
+        f"{quality.flip_fraction * 100:.1f}",
+        jitter,
+        well_detected,
+    ]
+
+
 def relative_pose(reference_tag, tag):
     """Return a tag's position and rotation in the reference tag's frame."""
     reference_rotation = np.asarray(reference_tag.pose_R, dtype=np.float64)
@@ -222,7 +322,9 @@ def build_output_paths(directory, bush_id, cane_id, started_at):
         attempt += 1
 
 
-def write_average_csv(path, bush_id, cane_id, timestamp, reference_id, averages, names):
+def write_average_csv(
+    path, bush_id, cane_id, timestamp, reference_id, averages, names, detection=None
+):
     """Write one row per tag, in the reference tag's frame.
 
     Args:
@@ -233,7 +335,10 @@ def write_average_csv(path, bush_id, cane_id, timestamp, reference_id, averages,
         reference_id: Reference tag ID.
         averages:     dict of tag_id -> AveragedPose.
         names:        dict of tag_id -> display name.
+        detection:    Optional dict of tag_id -> the four detection quality values
+                      from quality_columns(). Missing tags get blank values.
     """
+    detection = detection or {}
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8") as file:
@@ -253,5 +358,6 @@ def write_average_csv(path, bush_id, cane_id, timestamp, reference_id, averages,
                 average.n_frames,
                 average.n_rejected,
                 f"{average.pos_std_mm:.3f}",
+                *detection.get(tag_id, ["", "", "", ""]),
             ])
 

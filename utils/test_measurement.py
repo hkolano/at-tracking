@@ -6,6 +6,7 @@ Run from the repository root:
 
 import csv
 import json
+import math
 import os
 import subprocess
 import sys
@@ -20,14 +21,22 @@ import pytest
 from scipy.spatial.transform import Rotation as R
 
 from src import capture
-from src.capture import CaptureWorker
+from src.capture import CaptureWorker, RecordingResult
 from src.config import CameraConfig, Config, TrackedObjectConfig, load_config
 from src.data_collector import DataCollector
 from src.detection import TagPipeline
 from src import gui
-from src.gui import StatusHold, exposure_to_slider, judge_quality, slider_to_exposure
+from src.gui import (
+    StatusHold,
+    exposure_to_slider,
+    judge_quality,
+    slider_to_exposure,
+)
 from src.measurement import (
     DetectionQuality,
+    QualityLimits,
+    RecordingVerdict,
+    judge_recording,
     RollingMedian,
     TagQuality,
     average_poses,
@@ -638,6 +647,108 @@ def test_status_hold_ignores_blips_and_follows_lasting_changes():
     assert hold.update(1, "good", 2.7) == "good"
 
 
+def judge(quality, averaged_ids, reference_id=2):
+    """Judge a recording with the default limits."""
+    return judge_recording(quality, reference_id, averaged_ids, QualityLimits())
+
+
+def test_recording_checks_off_only_green_tags():
+    """Green tags are well detected; others are listed with the reason."""
+    quality = {
+        2: make_quality(),
+        0: make_quality(),
+        1: make_quality(flipped=0.3),
+        3: make_quality(since=4.0),  # hidden at the end of the recording is fine
+    }
+    assert judge(quality, {0, 1, 3}) == RecordingVerdict(frozenset({0, 3}), {1: "flips 30%"}, "")
+
+
+def test_recording_with_poor_reference_checks_off_nothing():
+    """If the reference wasn't green, no tag counts."""
+    verdict = judge({2: make_quality(jitter=25.0), 0: make_quality()}, {0})
+    assert verdict == RecordingVerdict(frozenset(), {}, "jitter 25 mm")
+
+
+def test_tag_without_a_csv_row_is_not_checked_off():
+    """A tag never seen alongside the reference has no CSV row, so it isn't recorded."""
+    assert judge({2: make_quality(), 0: make_quality()}, set()).well_detected == set()
+
+
+def test_gui_limits_reach_the_worker():
+    """The GUI's constants are the limits it gives the worker."""
+    assert gui.QUALITY_LIMITS.green_max_jitter_mm == gui.GREEN_MAX_JITTER_MM
+    assert gui.QUALITY_LIMITS.min_detected == gui.MIN_DETECTED
+
+
+def record_once(live):
+    """Make one 0.5 s recording on a running worker and return its RecordingResult."""
+    wait_for(lambda: live.get_state() is not None and 2 in live.get_state().visible_ids)
+    live.start_recording(0.5, "3", "12")
+    results = []
+    wait_for(lambda: results.extend(live.get_finished_recordings()) or results)
+    (result,) = results
+    return result
+
+
+def test_saved_recording_reports_and_stores_detection_quality(worker, tmp_path):
+    """The verdict reaches the GUI, the CSV, and the Parquet metadata."""
+    live = worker([{0: (300, 200), 1: (900, 200), 2: (600, 500)}])
+    assert live.get_finished_recordings() == []
+    result = record_once(live)
+
+    assert (result.bush_id, result.cane_id, result.reference_id) == ("3", "12", 2)
+    assert result.averaged_ids == {0, 1}
+    assert set(result.quality) == {0, 1, 2}
+    assert result.verdict.well_detected == {0, 1}
+
+    rows = read_rows(single_file(tmp_path, "*_average.csv"))
+    for row in rows:
+        assert row["detected_pct"] == "100.0" and row["flipped_pct"] == "0.0"
+        assert float(row["jitter_mm"]) < 1.0  # a still, rendered image
+        assert row["well_detected"] == "True"
+
+    table = pq.read_table(single_file(tmp_path, "*_frames.parquet"))
+    metadata = json.loads(table.schema.metadata[b"dataset_metadata"])
+    assert metadata["quality_limits"]["green_max_jitter_mm"] == QualityLimits().green_max_jitter_mm
+    assert metadata["well_detected_tag_ids"] == [0, 1]
+    assert metadata["reference_problem"] == ""
+    assert set(metadata["detection_quality"]) == {"0", "1", "2"}
+    assert metadata["detection_quality"]["2"]["well_detected"] is False  # the reference
+
+
+def test_poorly_detected_tag_is_saved_as_not_well_detected(worker, tmp_path):
+    """A tag in only some frames is in the CSV, marked as not well detected."""
+    both = {0: (300, 200), 1: (900, 200), 2: (600, 500)}
+    without_0 = {1: (900, 200), 2: (600, 500)}
+    live = worker([both, without_0, without_0] * 20)
+    result = record_once(live)
+
+    assert 0 not in result.verdict.well_detected and 1 in result.verdict.well_detected
+    rows = {row["tag_id"]: row for row in read_rows(single_file(tmp_path, "*_average.csv"))}
+    assert rows["0"]["well_detected"] == "False"
+    assert float(rows["0"]["detected_pct"]) < 70
+    assert rows["1"]["well_detected"] == "True"
+
+
+def test_fixing_tag_size_keeps_and_rescales_detection_quality(worker, tmp_path):
+    """Correcting a tag's size scales its jitter and keeps the quality columns."""
+    from utils.fix_tag_size import fix_recording
+
+    live = worker([{0: (300, 200), 1: (900, 200), 2: (600, 500)}])
+    record_once(live)
+    live.stop()
+    parquet = single_file(tmp_path, "*_frames.parquet")
+    before = {row["tag_id"]: row for row in read_rows(single_file(tmp_path, "*_average.csv"))}
+
+    fix_recording(parquet, 0, TAG_SIZE_M, TAG_SIZE_M * 2)
+
+    after = {row["tag_id"]: row for row in read_rows(single_file(tmp_path, "*_average.csv"))}
+    assert float(after["0"]["jitter_mm"]) == pytest.approx(2 * float(before["0"]["jitter_mm"]), abs=0.01)
+    for tag in ("0", "1"):
+        assert after[tag]["detected_pct"] == before[tag]["detected_pct"]
+        assert after[tag]["well_detected"] == "True"
+
+
 def test_worker_publishes_quality_for_every_visible_tag(worker):
     """The worker reports detection quality, including for the reference."""
     live = worker([{0: (300, 200), 1: (900, 200), 2: (600, 500)}])
@@ -659,6 +770,7 @@ def test_display_is_filtered_but_recorded_rows_stay_raw():
     live._recording.positions = {}
     live._recording.rotations = {}
     live._recording.collector = DataCollector()
+    live._recording.quality = DetectionQuality(math.inf)
 
     for index, x in enumerate([0.1, 0.1, 0.9, 0.1, 0.1]):
         tags = {2: reference, 1: FakePose(np.eye(3), [x, 0, 1])}

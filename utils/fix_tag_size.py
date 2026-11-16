@@ -6,6 +6,9 @@ This script does that in each recording's *_frames.parquet, then rebuilds the
 matching *_average.csv from the corrected frames. The originals are first copied to
 data/before_tag_size_fix/. Snapshots are left as they are.
 
+Recordings that store detection quality have the corrected tag's jitter rescaled,
+and are re-judged for well_detected with the limits saved in the recording.
+
 Run from the repository root, for example:
     python -m utils.fix_tag_size --tag 0 --recorded-size 0.08 --true-size 0.0254 \
         data/bushctyd_cane*_frames.parquet
@@ -22,7 +25,14 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from scipy.spatial.transform import Rotation as R
 
-from src.measurement import average_poses, write_average_csv
+from src.measurement import (
+    QualityLimits,
+    TagQuality,
+    average_poses,
+    judge_recording,
+    quality_columns,
+    write_average_csv,
+)
 
 BACKUP_DIR_NAME = "before_tag_size_fix"
 POSITION_TOLERANCE_M = 1e-5  # CSVs store 6 decimals, so 1e-6 m rounding.
@@ -72,6 +82,37 @@ def average_relative_poses(frames, reference_name, tag_ids):
             positions.setdefault(tag_id, []).append(reference_rotation.T @ (position - reference_position))
             rotations.setdefault(tag_id, []).append(reference_rotation.T @ rotation)
     return {tag_id: average_poses(positions[tag_id], rotations[tag_id]) for tag_id in positions}
+
+
+def rescale_detection(metadata, tag_id, scale, reference_id, averaged_ids):
+    """Rescale a tag's jitter in the metadata and re-judge well_detected.
+
+    Updates metadata in place. Returns the CSV's detection values, or None for
+    recordings made before detection quality was saved.
+    """
+    stored = metadata.get("detection_quality")
+    if stored is None:
+        return None
+    entry = stored.get(str(tag_id))
+    if entry is not None and entry["jitter_mm"] is not None:
+        entry["jitter_mm"] *= scale  # Position spread scales with tag size too.
+
+    quality = {
+        int(key): TagQuality(
+            value["detected_fraction"], value["flip_fraction"], value["jitter_mm"], 0.0
+        )
+        for key, value in stored.items()
+    }
+    limits = QualityLimits(**metadata["quality_limits"])
+    verdict = judge_recording(quality, reference_id, averaged_ids, limits)
+    for key, value in stored.items():
+        value["well_detected"] = int(key) in verdict.well_detected
+    metadata["well_detected_tag_ids"] = sorted(verdict.well_detected)
+    metadata["reference_problem"] = verdict.reference_problem
+    return {
+        tag: quality_columns(quality.get(tag), tag in verdict.well_detected)
+        for tag in averaged_ids
+    }
 
 
 def read_csv_rows(csv_path):
@@ -130,6 +171,9 @@ def fix_recording(parquet_path, tag_id, recorded_size, true_size, dry_run=False)
     is_tag = frames["name"] == tag_name
     frames.loc[is_tag, ["x", "y", "z"]] *= true_size / recorded_size
     averages = average_relative_poses(frames, reference_name, tag_ids)
+    detection = rescale_detection(
+        metadata, tag_id, true_size / recorded_size, reference_id, set(averages)
+    )
 
     print(f"{parquet_path.name}: {int(is_tag.sum())} rows of {tag_name} rescaled")
     for tag, average in sorted(averages.items()):
@@ -168,6 +212,7 @@ def fix_recording(parquet_path, tag_id, recorded_size, true_size, dry_run=False)
         reference_id,
         averages,
         names,
+        detection=detection,
     )
 
 

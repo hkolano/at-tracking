@@ -10,17 +10,27 @@ import os
 import sys
 import time
 import tkinter as tk
-from tkinter import ttk
+from tkinter import messagebox, ttk
 
 import cv2
 from PIL import Image, ImageTk
 
 from src.capture import CaptureWorker
 from src.config import load_config
-from src.measurement import DISPLAY_FILTER_SECONDS, clean_id
+from src import measurement
+from src.measurement import (
+    DISPLAY_FILTER_SECONDS,
+    STATUS_FAIR,
+    STATUS_GOOD,
+    STATUS_NONE,
+    QualityLimits,
+    clean_id,
+)
 
 # ---- Detection quality: row colours in the tag table -------------------------
 # Each tag is judged over the last QUALITY_WINDOW_SECONDS, in the camera frame.
+# A recording is judged by the same limits over its whole length: a tag is saved as
+# well_detected in the CSV, and checked off, if it and the reference were green.
 #   Green:     detected in at least GREEN_MIN_DETECTED of frames, at most
 #              GREEN_MAX_FLIPPED of those flipped, and jitter at most GREEN_MAX_JITTER_MM.
 #   Yellow:    detected, but missing at least one green limit.
@@ -41,11 +51,21 @@ STATUS_HOLD_SECONDS = 1.0
 REQUIRE_GOOD_REFERENCE = True
 COLOR_GOOD = "#c8e6c9"
 COLOR_FAIR = "#fff1a8"
+# Tags already recorded green for this cane are greyed out and checked off.
+COLOR_DONE_BACKGROUND = "#ececec"
+COLOR_DONE_TEXT = "#9a9a9a"
+CHECKMARK = "\u2714"
+COLOR_ALL_RECORDED = "#1b7a2b"  # text saying every tag is recorded
 # -----------------------------------------------------------------------------
 
-STATUS_GOOD = "good"
-STATUS_FAIR = "fair"
-STATUS_NONE = "none"
+QUALITY_LIMITS = QualityLimits(
+    min_detected=MIN_DETECTED,
+    green_min_detected=GREEN_MIN_DETECTED,
+    green_max_flipped=GREEN_MAX_FLIPPED,
+    green_max_jitter_mm=GREEN_MAX_JITTER_MM,
+    not_seen_seconds=NOT_SEEN_SECONDS,
+)
+STATUS_DONE = "done"
 
 POLL_MILLISECONDS = 30
 # Wait this long after the slider stops moving before changing the camera's exposure.
@@ -74,31 +94,8 @@ def exposure_to_slider(exposure, low, high):
 
 
 def judge_quality(quality):
-    """Return (status, text) for a tag's TagQuality, or for None if it isn't detected.
-
-    The text is short enough for the table: the jitter when the tag is good, or what
-    keeps it from being good.
-    """
-    if (
-        quality is None
-        or quality.seconds_since_seen > NOT_SEEN_SECONDS
-        or quality.detected_fraction < MIN_DETECTED
-    ):
-        return STATUS_NONE, ""
-
-    problems = []
-    if quality.detected_fraction < GREEN_MIN_DETECTED:
-        problems.append(f"seen {quality.detected_fraction:.0%}")
-    if quality.flip_fraction > GREEN_MAX_FLIPPED:
-        problems.append(f"flips {quality.flip_fraction:.0%}")
-    if quality.jitter_mm is None:
-        problems.append("few frames")
-    elif quality.jitter_mm > GREEN_MAX_JITTER_MM:
-        problems.append(f"jitter {quality.jitter_mm:.0f} mm")
-
-    if problems:
-        return STATUS_FAIR, ", ".join(problems)
-    return STATUS_GOOD, f"good, {quality.jitter_mm:.0f} mm"
+    """Return (status, text) for a tag's live TagQuality, using the limits above."""
+    return measurement.judge_quality(quality, QUALITY_LIMITS)
 
 
 class StatusHold:
@@ -142,6 +139,8 @@ class TrackerApp:
         self.reference_status = STATUS_NONE
         self.reference_problem = ""
         self.status_hold = StatusHold()
+        self.recorded = set()  # tags recorded green for this cane
+        self.all_recorded_shown = False
         self.exposure_ready = False
 
         self.root.title("Tag Measurement")
@@ -177,22 +176,37 @@ class TrackerApp:
         self.reference_box.pack(side="left", padx=(6, 0))
         self.reference_box.bind("<<ComboboxSelected>>", self._on_reference_selected)
 
-        columns = ("tag", "name", "x", "y", "z", "detection")
+        columns = ("tag", "name", "x", "y", "z", "detection", "recorded")
         self.table = ttk.Treeview(panel, columns=columns, show="headings", height=14)
         headings = {
             "tag": "Tag", "name": "Name", "x": "x (m)", "y": "y (m)", "z": "z (m)",
-            "detection": "Detection",
+            "detection": "Detection", "recorded": "Recorded?",
         }
-        widths = {"tag": 45, "name": 90, "x": 80, "y": 70, "z": 70, "detection": 155}
+        widths = {
+            "tag": 45, "name": 90, "x": 80, "y": 70, "z": 70, "detection": 155, "recorded": 90,
+        }
+        anchors = {"x": "e", "y": "e", "z": "e", "recorded": "center"}
         for column in columns:
             self.table.heading(column, text=headings[column])
-            self.table.column(column, width=widths[column], anchor="e" if column in "xyz" else "w")
+            self.table.column(column, width=widths[column], anchor=anchors.get(column, "w"))
         self.table.tag_configure(STATUS_GOOD, background=COLOR_GOOD)
         self.table.tag_configure(STATUS_FAIR, background=COLOR_FAIR)
+        self.table.tag_configure(
+            STATUS_DONE, background=COLOR_DONE_BACKGROUND, foreground=COLOR_DONE_TEXT
+        )
         self.table.grid(row=1, column=0, sticky="ns")
 
-        self.hint = ttk.Label(panel, text="Choose a reference tag.", wraplength=470)
-        self.hint.grid(row=2, column=0, sticky="w", pady=(6, 10))
+        hint_area = ttk.Frame(panel)
+        hint_area.grid(row=2, column=0, sticky="w", pady=(6, 10))
+        self.hint = ttk.Label(hint_area, text="Choose a reference tag.", wraplength=470)
+        self.hint.pack(anchor="w")
+        # Shown in green, below the hint, once every tag seen so far is checked off.
+        self.all_recorded_label = ttk.Label(
+            hint_area,
+            text="Every tag seen so far is recorded. Press New cane to start the next one.",
+            foreground=COLOR_ALL_RECORDED,
+            wraplength=470,
+        )
 
         exposure_row = ttk.Frame(panel)
         exposure_row.grid(row=3, column=0, sticky="ew", pady=(0, 8))
@@ -219,6 +233,8 @@ class TrackerApp:
         ttk.Label(id_row, text="Cane ID:").pack(side="left")
         self.cane_entry = ttk.Entry(id_row, width=10)
         self.cane_entry.pack(side="left", padx=(6, 0))
+        self.new_cane_button = ttk.Button(id_row, text="New cane", command=self._on_new_cane)
+        self.new_cane_button.pack(side="right")
 
         record_row = ttk.Frame(panel)
         record_row.grid(row=5, column=0, sticky="ew", pady=(8, 0))
@@ -289,6 +305,57 @@ class TrackerApp:
         self.record_button.configure(state="disabled")
         self._set_status("Recording...")
 
+    def _on_new_cane(self):
+        """Clear the checkmarks and the Cane ID, after confirming if any tags are checked."""
+        if self.recorded and not messagebox.askyesno(
+            "New cane",
+            f"Clear the checkmarks for {len(self.recorded)} recorded tags, and the Cane ID?",
+            parent=self.root,
+        ):
+            return
+        self.recorded.clear()
+        self.cane_entry.delete(0, "end")
+        self.cane_entry.focus_set()
+        self._set_status("Checkmarks cleared for a new cane. Enter its Cane ID.")
+
+    def _check_off_recordings(self):
+        """Check off tags that finished recordings captured well, and say which."""
+        for result in self.worker.get_finished_recordings():
+            verdict = result.verdict
+            good, poor, reference_problem = (
+                verdict.well_detected, verdict.problems, verdict.reference_problem
+            )
+            if reference_problem:
+                message = (
+                    f"No tags checked off: the reference wasn't detected well "
+                    f"({reference_problem})."
+                )
+            else:
+                self.recorded.update(good)
+                parts = []
+                if good:
+                    parts.append(f"Checked off: {self._tag_list(good)}.")
+                if poor:
+                    reasons = ", ".join(
+                        f"{self._tag_name(tag_id)} ({text})" for tag_id, text in poor.items()
+                    )
+                    parts.append(f"Not good enough: {reasons}.")
+                message = " ".join(parts) or "No tags were seen with the reference."
+            self._append_status(message)
+
+    def _tag_name(self, tag_id):
+        """Return a tag's display name."""
+        return self.worker.names.get(tag_id, f"tag_{tag_id}")
+
+    def _tag_list(self, tag_ids):
+        """Return tag names as a comma-separated list, in ID order."""
+        return ", ".join(self._tag_name(tag_id) for tag_id in sorted(tag_ids))
+
+    def _append_status(self, text):
+        """Add a message after the one already in the status bar."""
+        current = self.status_label.cget("text")
+        self.status_label.configure(text=f"{current}  {text}" if current else text)
+
     def _set_status(self, text, is_error=False):
         """Show a message in the status bar."""
         self.status_label.configure(text=text, foreground=COLOR_ERROR if is_error else COLOR_NORMAL)
@@ -296,6 +363,7 @@ class TrackerApp:
     def poll(self):
         """Show the worker's latest results, then schedule the next poll."""
         self._show_notices()
+        self._check_off_recordings()
         state = self.worker.get_state()
         self._show_connection(state)
         if state is not None and state.sequence != self.last_sequence:
@@ -364,7 +432,10 @@ class TrackerApp:
 
         for tag_id in tag_ids:
             status, text = self._judge(tag_id, state, now)
-            values = (*self._row_values(tag_id, state), text)
+            check = ""
+            if tag_id in self.recorded:
+                status, check = STATUS_DONE, CHECKMARK
+            values = (*self._row_values(tag_id, state), text, check)
             if tag_id in self.rows:
                 self.table.item(self.rows[tag_id], values=values, tags=(status,))
             else:
@@ -385,7 +456,7 @@ class TrackerApp:
         status, text = self._judge(state.reference_id, state, now)
         self.reference_status = status
         self.reference_problem = text if status == STATUS_FAIR else ""
-        values = (state.reference_id, "reference", "origin", "", "", text)
+        values = (state.reference_id, "reference", "origin", "", "", text, "")
         if self.reference_row is None:
             self.reference_row = self.table.insert("", 0, values=values, tags=(status,))
         else:
@@ -463,7 +534,15 @@ class TrackerApp:
         )
         self.record_button.configure(state="normal" if can_record else "disabled")
         self.reference_box.configure(state="disabled" if recording else "readonly")
+        self.new_cane_button.configure(state="disabled" if recording else "normal")
         self.hint.configure(text=self._hint_text(state))
+        all_recorded = bool(self.rows) and set(self.rows) <= self.recorded
+        if all_recorded != self.all_recorded_shown:
+            self.all_recorded_shown = all_recorded
+            if all_recorded:
+                self.all_recorded_label.pack(anchor="w", pady=(4, 0))
+            else:
+                self.all_recorded_label.pack_forget()
 
         exposure_locked = recording or not connected or not self.exposure_ready
         self.auto_check.configure(state="disabled" if exposure_locked else "normal")
@@ -496,6 +575,7 @@ def main():
         load_config(args.config),
         output_dir=args.output_dir,
         quality_window_seconds=QUALITY_WINDOW_SECONDS,
+        quality_limits=QUALITY_LIMITS,
     )
     root = tk.Tk()
     app = TrackerApp(root, worker)
