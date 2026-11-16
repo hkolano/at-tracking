@@ -1,6 +1,6 @@
 """Load and validate the YAML file describing tags and tracked objects."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -35,8 +35,12 @@ class Config:
     decision_margin: float = 3.0
     reference_tag: int | None = None
     camera: CameraConfig = CameraConfig()
+    # tag_id -> edge length in metres, for tags that differ from tag_size_m
+    # (for example a larger reference tag).
+    tag_sizes_m: dict = field(default_factory=dict)
 
     def build_trackers(self) -> list[Tracker]:
+        """Return a fresh Tracker for each object."""
         return [Tracker(obj.name, obj.tag_ids, obj.offsets) for obj in self.objects]
 
 
@@ -76,7 +80,22 @@ def _parse_object(raw: dict) -> TrackedObjectConfig:
     )
 
 
+def _parse_tag_sizes(raw) -> dict:
+    """Return tag_id -> size in metres from the optional tag_sizes_m mapping."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("tag_sizes_m must map tag IDs to sizes, for example {10: 0.1}")
+    sizes = {}
+    for tag_id, size in raw.items():
+        if size is None or float(size) <= 0:
+            raise ValueError(f"tag_sizes_m: tag {tag_id} needs a positive size")
+        sizes[int(tag_id)] = float(size)
+    return sizes
+
+
 def load_config(path: str | Path) -> Config:
+    """Read a YAML config file and check it for mistakes."""
     with open(path, encoding="utf-8") as file:
         raw = yaml.safe_load(file) or {}
 
@@ -111,4 +130,5 @@ def load_config(path: str | Path) -> Config:
         decision_margin=float(raw.get("decision_margin", 3.0)),
         reference_tag=reference_tag,
         camera=CameraConfig(**(raw.get("camera") or {})),
+        tag_sizes_m=_parse_tag_sizes(raw.get("tag_sizes_m")),
     )

@@ -72,6 +72,80 @@ class RollingMedian:
         self.samples.clear()
 
 
+@dataclass(frozen=True)
+class TagQuality:
+    """How well one tag has been detected over a recent window, in the camera frame."""
+
+    detected_fraction: float  # share of frames in the window where the tag was found
+    flip_fraction: float      # share of those detections that are orientation flips
+    jitter_mm: float | None   # robust spread of position on the worst axis; None if too few frames
+    seconds_since_seen: float
+
+
+class DetectionQuality:
+    """Measure how consistently each tag is detected, frame by frame."""
+
+    # Below this many unflipped detections, jitter isn't measured.
+    MIN_FRAMES_FOR_JITTER = 3
+
+    def __init__(self, window_seconds):
+        """Start with no frames."""
+        self.window_seconds = window_seconds
+        self.frame_times = deque()
+        self.samples = {}  # tag_id -> deque of (time, position, rotation matrix)
+
+    def add_frame(self, now, poses):
+        """Add one frame's detections.
+
+        Args:
+            now:   Frame time in seconds.
+            poses: dict of tag_id -> (position, rotation matrix), in the camera frame.
+                   Tags missing from it count as not detected in this frame.
+        """
+        self.frame_times.append(now)
+        for tag_id, (position, rotation) in poses.items():
+            self.samples.setdefault(tag_id, deque()).append(
+                (now, np.asarray(position, dtype=np.float64).reshape(3),
+                 np.asarray(rotation, dtype=np.float64))
+            )
+
+    def qualities(self, now):
+        """Return tag_id -> TagQuality for tags detected within the window."""
+        while self.frame_times and now - self.frame_times[0] > self.window_seconds:
+            self.frame_times.popleft()
+        results = {}
+        for tag_id in list(self.samples):
+            tag_samples = self.samples[tag_id]
+            while tag_samples and now - tag_samples[0][0] > self.window_seconds:
+                tag_samples.popleft()
+            if not tag_samples:
+                del self.samples[tag_id]
+                continue
+            results[tag_id] = self._quality(tag_samples, now)
+        return results
+
+    def _quality(self, tag_samples, now):
+        """Summarize one tag's detections in the window."""
+        positions = np.array([position for _, position, _ in tag_samples])
+        rotations = R.from_matrix(np.array([rotation for _, _, rotation in tag_samples]))
+        flipped = _typical_rotation_angles(rotations) > ROTATION_OUTLIER_DEG
+
+        kept = positions[~flipped]
+        jitter_mm = None
+        if len(kept) >= self.MIN_FRAMES_FOR_JITTER:
+            # Median absolute deviation, scaled to match a standard deviation for
+            # normal noise, so a single bad frame can't dominate.
+            spread = 1.4826 * np.median(np.abs(kept - np.median(kept, axis=0)), axis=0)
+            jitter_mm = float(spread.max() * 1000.0)
+
+        return TagQuality(
+            detected_fraction=min(len(tag_samples) / max(len(self.frame_times), 1), 1.0),
+            flip_fraction=float(flipped.mean()),
+            jitter_mm=jitter_mm,
+            seconds_since_seen=now - tag_samples[-1][0],
+        )
+
+
 def relative_pose(reference_tag, tag):
     """Return a tag's position and rotation in the reference tag's frame."""
     reference_rotation = np.asarray(reference_tag.pose_R, dtype=np.float64)

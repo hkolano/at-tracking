@@ -26,12 +26,16 @@ class TagPipeline:
         tag_family="tag36h11",
         decision_margin=3.0,
         reference_id=None,
+        tag_sizes_m=None,
     ):
         """
         Args:
             trackers:        Tracker instances to update each frame.
             camera_params:   (fx, fy, cx, cy) in pixels.
             tag_size_m:      Edge length of the tag's black square, in metres.
+            tag_sizes_m:     Optional dict of tag_id -> edge length in metres for
+                             tags whose size differs from tag_size_m. These tags
+                             are also accepted even if no tracker uses them.
             tag_family:      AprilTag family name.
             decision_margin: Minimum detector confidence (higher = stricter).
             reference_id:    Fixed tag defining the output frame, or None for
@@ -40,6 +44,7 @@ class TagPipeline:
         self.trackers = trackers
         self.camera_params = camera_params
         self.tag_size_m = tag_size_m
+        self.tag_sizes_m = dict(tag_sizes_m or {})
         self.decision_margin = decision_margin
         self.reference_id = reference_id
         self.last_reference_pose = None  # persists across brief occlusions
@@ -47,6 +52,7 @@ class TagPipeline:
         self.allowed_ids = {tag_id for tracker in trackers for tag_id in tracker.ids}
         if reference_id is not None:
             self.allowed_ids.add(reference_id)
+        self.allowed_ids.update(self.tag_sizes_m)
 
         self.detector = Detector(
             families=tag_family,
@@ -80,7 +86,12 @@ class TagPipeline:
         return tag_dict
 
     def detect_tags(self, frame):
-        """Run AprilTag detection and filter by ID and decision margin."""
+        """Run AprilTag detection and filter by ID and decision margin.
+
+        The detector takes a single tag size, so every tag is solved at tag_size_m
+        and tags of another size have their position rescaled. Position scales
+        exactly with tag size and rotation doesn't change.
+        """
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         raw_tags = self.detector.detect(
             gray,
@@ -88,12 +99,16 @@ class TagPipeline:
             camera_params=self.camera_params,
             tag_size=self.tag_size_m,
         )
-        return {
+        tags = {
             tag.tag_id: tag
             for tag in raw_tags
             if tag.decision_margin > self.decision_margin
             and tag.tag_id in self.allowed_ids
         }
+        for tag_id, size in self.tag_sizes_m.items():
+            if tag_id in tags:
+                tags[tag_id].pose_t = tags[tag_id].pose_t * (size / self.tag_size_m)
+        return tags
 
     def _transform_to_output_frame(self, tag_dict):
         """Return tag poses in either the camera or the reference-tag frame."""

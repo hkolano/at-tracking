@@ -37,6 +37,7 @@ def _build_metadata(config, camera, trackers):
         "quaternion_order": "xyzw",
         "tag_family": config.tag_family,
         "tag_size_m": config.tag_size_m,
+        "tag_sizes_m": {str(tag_id): size for tag_id, size in config.tag_sizes_m.items()},
         "decision_margin_threshold": config.decision_margin,
         "camera": {
             "stream": "color",
@@ -74,6 +75,7 @@ def main():
         tag_family=config.tag_family,
         decision_margin=config.decision_margin,
         reference_id=config.reference_tag,
+        tag_sizes_m=config.tag_sizes_m,
     )
     collector = DataCollector(metadata=_build_metadata(config, camera, trackers))
 

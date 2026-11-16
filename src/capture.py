@@ -20,6 +20,7 @@ from src.camera import RealSenseCamera
 from src.data_collector import DataCollector
 from src.detection import TagPipeline
 from src.measurement import (
+    DetectionQuality,
     RollingMedian,
     average_poses,
     build_output_paths,
@@ -33,6 +34,8 @@ REJECTED_WARNING_FRACTION = 0.2
 FPS_WINDOW_FRAMES = 30
 # Wait between attempts to reopen a lost camera.
 RECONNECT_DELAY_SECONDS = 2.0
+# Default window for judging how well each tag is detected.
+QUALITY_WINDOW_SECONDS = 2.0
 
 
 @dataclass(frozen=True)
@@ -45,6 +48,7 @@ class CaptureState:
     visible_ids: frozenset
     seen_ids: tuple               # every tag ID seen this session, sorted
     relative_positions: dict      # tag_id -> (3,) filtered position in the reference frame
+    quality: dict                 # tag_id -> TagQuality, for tags detected recently
     reference_id: int | None
     recording_remaining: float | None  # seconds left, or None when not recording
     exposure_range: tuple         # (lowest, highest) manual exposure
@@ -92,7 +96,13 @@ def tag_names_from_config(config):
 class CaptureWorker:
     """Run the camera loop on a background thread."""
 
-    def __init__(self, config, output_dir="data", camera_factory=RealSenseCamera):
+    def __init__(
+        self,
+        config,
+        output_dir="data",
+        camera_factory=RealSenseCamera,
+        quality_window_seconds=QUALITY_WINDOW_SECONDS,
+    ):
         """Prepare the worker. Call start() to open the camera."""
         self.config = config
         self.output_dir = Path(output_dir)
@@ -112,6 +122,7 @@ class CaptureWorker:
         self._frame_times = deque(maxlen=FPS_WINDOW_FRAMES)
 
         self._position_filter = RollingMedian()
+        self._quality = DetectionQuality(quality_window_seconds)
         self._filter_reference_id = None
 
         self._exposure = config.camera.exposure
@@ -224,6 +235,7 @@ class CaptureWorker:
                 tag_family=self.config.tag_family,
                 decision_margin=self.config.decision_margin,
                 reference_id=self.config.reference_tag,
+                tag_sizes_m=self.config.tag_sizes_m,
             )
         else:
             # The same camera comes back, so the existing detector is reused.
@@ -349,6 +361,10 @@ class CaptureWorker:
                     position, _ = relative_pose(tag_dict[reference_id], tag)
                     self._position_filter.add(tag_id, now, position)
 
+        self._quality.add_frame(
+            now, {tag_id: (tag.pose_t, tag.pose_R) for tag_id, tag in tag_dict.items()}
+        )
+
         with self._lock:
             previous = self._state.sequence if self._state is not None else 0
             self._state = CaptureState(
@@ -358,6 +374,7 @@ class CaptureWorker:
                 visible_ids=frozenset(tag_dict),
                 seen_ids=tuple(sorted(self._seen_ids)),
                 relative_positions=self._position_filter.medians(now),
+                quality=self._quality.qualities(now),
                 reference_id=reference_id,
                 recording_remaining=remaining,
                 exposure_range=self._exposure_range,
@@ -404,6 +421,7 @@ class CaptureWorker:
             "quaternion_order": "xyzw",
             "tag_family": self.config.tag_family,
             "tag_size_m": self.config.tag_size_m,
+            "tag_sizes_m": {str(tag_id): size for tag_id, size in self.config.tag_sizes_m.items()},
             "decision_margin_threshold": self.config.decision_margin,
             "tag_names": {str(tag_id): name for tag_id, name in self.names.items()},
             "camera": {

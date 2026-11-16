@@ -8,6 +8,7 @@ import argparse
 import math
 import os
 import sys
+import time
 import tkinter as tk
 from tkinter import ttk
 
@@ -17,6 +18,34 @@ from PIL import Image, ImageTk
 from src.capture import CaptureWorker
 from src.config import load_config
 from src.measurement import DISPLAY_FILTER_SECONDS, clean_id
+
+# ---- Detection quality: row colours in the tag table -------------------------
+# Each tag is judged over the last QUALITY_WINDOW_SECONDS, in the camera frame.
+#   Green:     detected in at least GREEN_MIN_DETECTED of frames, at most
+#              GREEN_MAX_FLIPPED of those flipped, and jitter at most GREEN_MAX_JITTER_MM.
+#   Yellow:    detected, but missing at least one green limit.
+#   No colour: detected in under MIN_DETECTED of frames, or not seen for NOT_SEEN_SECONDS.
+QUALITY_WINDOW_SECONDS = 2.0
+MIN_DETECTED = 0.20             # share of frames
+GREEN_MIN_DETECTED = 0.70       # share of frames
+# A flip is a frame more than ROTATION_OUTLIER_DEG (15 degrees) from the tag's typical
+# rotation, the same test the CSV uses to drop frames.
+GREEN_MAX_FLIPPED = 0.15        # share of detections
+# Robust standard deviation of position on the worst axis, after removing flips.
+# It averages out over a recording: the CSV's error is roughly jitter / sqrt(frames).
+GREEN_MAX_JITTER_MM = 10.0
+NOT_SEEN_SECONDS = 1.0
+# A row's colour only changes once the new colour has lasted this long, to stop flicker.
+STATUS_HOLD_SECONDS = 1.0
+# Only allow recording while the reference tag's row is green.
+REQUIRE_GOOD_REFERENCE = True
+COLOR_GOOD = "#c8e6c9"
+COLOR_FAIR = "#fff1a8"
+# -----------------------------------------------------------------------------
+
+STATUS_GOOD = "good"
+STATUS_FAIR = "fair"
+STATUS_NONE = "none"
 
 POLL_MILLISECONDS = 30
 # Wait this long after the slider stops moving before changing the camera's exposure.
@@ -44,6 +73,58 @@ def exposure_to_slider(exposure, low, high):
     return min(position, 1.0)
 
 
+def judge_quality(quality):
+    """Return (status, text) for a tag's TagQuality, or for None if it isn't detected.
+
+    The text is short enough for the table: the jitter when the tag is good, or what
+    keeps it from being good.
+    """
+    if (
+        quality is None
+        or quality.seconds_since_seen > NOT_SEEN_SECONDS
+        or quality.detected_fraction < MIN_DETECTED
+    ):
+        return STATUS_NONE, ""
+
+    problems = []
+    if quality.detected_fraction < GREEN_MIN_DETECTED:
+        problems.append(f"seen {quality.detected_fraction:.0%}")
+    if quality.flip_fraction > GREEN_MAX_FLIPPED:
+        problems.append(f"flips {quality.flip_fraction:.0%}")
+    if quality.jitter_mm is None:
+        problems.append("few frames")
+    elif quality.jitter_mm > GREEN_MAX_JITTER_MM:
+        problems.append(f"jitter {quality.jitter_mm:.0f} mm")
+
+    if problems:
+        return STATUS_FAIR, ", ".join(problems)
+    return STATUS_GOOD, f"good, {quality.jitter_mm:.0f} mm"
+
+
+class StatusHold:
+    """Show a new status only once it has lasted a while, so colours don't flicker."""
+
+    def __init__(self, hold_seconds=STATUS_HOLD_SECONDS):
+        """Start with nothing shown."""
+        self.hold_seconds = hold_seconds
+        self.shown = {}    # key -> status on screen
+        self.pending = {}  # key -> (status, time it first appeared)
+
+    def update(self, key, status, now):
+        """Report the latest status for a row and return the one to show."""
+        if key not in self.shown or status == self.shown[key]:
+            self.shown[key] = status
+            self.pending.pop(key, None)
+            return status
+        pending_status, since = self.pending.get(key, (None, now))
+        if pending_status != status:
+            self.pending[key] = (status, now)
+        elif now - since >= self.hold_seconds:
+            self.shown[key] = status
+            del self.pending[key]
+        return self.shown[key]
+
+
 class TrackerApp:
     """Window showing the camera, live tag positions, and recording controls."""
 
@@ -57,6 +138,10 @@ class TrackerApp:
         self.was_connected = False
         self.photo = None  # Tk only shows an image while a reference to it exists.
         self.rows = {}     # tag_id -> table row
+        self.reference_row = None  # table row for the reference tag, always first
+        self.reference_status = STATUS_NONE
+        self.reference_problem = ""
+        self.status_hold = StatusHold()
         self.exposure_ready = False
 
         self.root.title("Tag Measurement")
@@ -92,16 +177,21 @@ class TrackerApp:
         self.reference_box.pack(side="left", padx=(6, 0))
         self.reference_box.bind("<<ComboboxSelected>>", self._on_reference_selected)
 
-        columns = ("tag", "name", "x", "y", "z")
+        columns = ("tag", "name", "x", "y", "z", "detection")
         self.table = ttk.Treeview(panel, columns=columns, show="headings", height=14)
-        headings = {"tag": "Tag", "name": "Name", "x": "x (m)", "y": "y (m)", "z": "z (m)"}
-        widths = {"tag": 45, "name": 100, "x": 75, "y": 75, "z": 75}
+        headings = {
+            "tag": "Tag", "name": "Name", "x": "x (m)", "y": "y (m)", "z": "z (m)",
+            "detection": "Detection",
+        }
+        widths = {"tag": 45, "name": 90, "x": 80, "y": 70, "z": 70, "detection": 155}
         for column in columns:
             self.table.heading(column, text=headings[column])
             self.table.column(column, width=widths[column], anchor="e" if column in "xyz" else "w")
+        self.table.tag_configure(STATUS_GOOD, background=COLOR_GOOD)
+        self.table.tag_configure(STATUS_FAIR, background=COLOR_FAIR)
         self.table.grid(row=1, column=0, sticky="ns")
 
-        self.hint = ttk.Label(panel, text="Choose a reference tag.", wraplength=360)
+        self.hint = ttk.Label(panel, text="Choose a reference tag.", wraplength=470)
         self.hint.grid(row=2, column=0, sticky="w", pady=(6, 10))
 
         exposure_row = ttk.Frame(panel)
@@ -266,18 +356,46 @@ class TrackerApp:
             self.reference_box.set(str(state.reference_id))
 
     def _update_table(self, state):
-        """Show every non-reference tag, removing the row of a new reference."""
+        """Show the reference tag first, then every other tag, coloured by detection."""
+        now = time.monotonic()
         tag_ids = [tag_id for tag_id in state.seen_ids if tag_id != state.reference_id]
         for tag_id in set(self.rows) - set(tag_ids):
             self.table.delete(self.rows.pop(tag_id))
 
         for tag_id in tag_ids:
-            values = self._row_values(tag_id, state)
+            status, text = self._judge(tag_id, state, now)
+            values = (*self._row_values(tag_id, state), text)
             if tag_id in self.rows:
-                self.table.item(self.rows[tag_id], values=values)
+                self.table.item(self.rows[tag_id], values=values, tags=(status,))
             else:
                 position = sum(other < tag_id for other in self.rows)
-                self.rows[tag_id] = self.table.insert("", position, values=values)
+                self.rows[tag_id] = self.table.insert("", position, values=values, tags=(status,))
+
+        self._update_reference_row(state, now)
+
+    def _update_reference_row(self, state, now):
+        """Keep the reference tag's row at the top, with its own detection status."""
+        if state.reference_id is None:
+            if self.reference_row is not None:
+                self.table.delete(self.reference_row)
+                self.reference_row = None
+            self.reference_status, self.reference_problem = STATUS_NONE, ""
+            return
+
+        status, text = self._judge(state.reference_id, state, now)
+        self.reference_status = status
+        self.reference_problem = text if status == STATUS_FAIR else ""
+        values = (state.reference_id, "reference", "origin", "", "", text)
+        if self.reference_row is None:
+            self.reference_row = self.table.insert("", 0, values=values, tags=(status,))
+        else:
+            self.table.item(self.reference_row, values=values, tags=(status,))
+            self.table.move(self.reference_row, "", 0)
+
+    def _judge(self, tag_id, state, now):
+        """Return a tag's status, held steady against flicker, and its detection text."""
+        status, text = judge_quality(state.quality.get(tag_id))
+        return self.status_hold.update(tag_id, status, now), text
 
     def _set_up_exposure(self, state):
         """Match the exposure controls to the camera on the first frame."""
@@ -299,12 +417,16 @@ class TrackerApp:
             return "Choose a reference tag."
 
         parts = []
-        if state.reference_id in state.visible_ids:
+        if state.reference_id not in state.visible_ids:
+            parts.append(f"Reference tag {state.reference_id} is not visible.")
+        else:
             parts.append(
                 f"{DISPLAY_FILTER_SECONDS:g} s median, relative to tag {state.reference_id}."
             )
-        else:
-            parts.append(f"Reference tag {state.reference_id} is not visible.")
+            if self.reference_status != STATUS_GOOD:
+                problem = f" ({self.reference_problem})" if self.reference_problem else ""
+                needed = " Recording needs it green." if REQUIRE_GOOD_REFERENCE else ""
+                parts.append(f"The reference isn't detected well{problem}.{needed}")
 
         missing = [
             name
@@ -333,9 +455,12 @@ class TrackerApp:
             and state.reference_id is not None
             and state.reference_id in state.visible_ids
         )
+        reference_ok = self.reference_status == STATUS_GOOD or not REQUIRE_GOOD_REFERENCE
         ids_entered = clean_id(self.bush_entry.get()) and clean_id(self.cane_entry.get())
         connected = self.worker.is_connected()
-        can_record = reference_visible and ids_entered and not recording and connected
+        can_record = (
+            reference_visible and reference_ok and ids_entered and not recording and connected
+        )
         self.record_button.configure(state="normal" if can_record else "disabled")
         self.reference_box.configure(state="disabled" if recording else "readonly")
         self.hint.configure(text=self._hint_text(state))
@@ -367,7 +492,11 @@ def main():
     parser.add_argument("--output-dir", default="data", help="Folder for recordings")
     args = parser.parse_args()
 
-    worker = CaptureWorker(load_config(args.config), output_dir=args.output_dir)
+    worker = CaptureWorker(
+        load_config(args.config),
+        output_dir=args.output_dir,
+        quality_window_seconds=QUALITY_WINDOW_SECONDS,
+    )
     root = tk.Tk()
     app = TrackerApp(root, worker)
     worker.start()

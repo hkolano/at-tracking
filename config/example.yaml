@@ -5,6 +5,12 @@
 tag_size_m: 0.0254
 tag_family: tag36h11
 
+# Tags whose black square is a different size from tag_size_m, as tag ID: metres.
+# A larger reference tag gives a steadier reference frame. Tags listed here can be
+# chosen as the reference in the GUI even if they aren't in any object.
+# tag_sizes_m:
+#   0: 0.080
+
 # Minimum detector confidence. Higher rejects more false or poor detections.
 decision_margin: 3.0
 
@@ -23,22 +29,22 @@ camera:
 #
 # Tag IDs can't be shared between objects.
 objects:
-  - name: cane_0
+  - name: tag_0
     tags:
       - id: 0
-  - name: cane_1
+  - name: tag_1
     tags:
       - id: 1
-  - name: cane_2
+  - name: tag_2
     tags:
       - id: 2
-  - name: cane_3
+  - name: tag_3
     tags:
       - id: 3
-  - name: cane_4
+  - name: tag_4
     tags:
       - id: 4
-  - name: cane_5
+  - name: tag_5
     tags:
       - id: 5
 

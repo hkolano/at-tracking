@@ -36,6 +36,21 @@ plugging back in. Closing the window still ends the program in that case: if the
 camera isn't released within 10 seconds, the program ends itself so the camera is
 freed.
 
+The reference tag has its own row at the top of the table. Each row's colour shows
+how well that tag has been detected over the last 2 seconds, measured in the camera
+frame:
+
+| Colour | Meaning |
+|---|---|
+| Green | Detected in at least 70% of frames, at most 15% of them flipped, and jitter at most 10 mm |
+| Yellow | Detected, but missing at least one green limit. The **Detection** column says which |
+| None | Detected in under 20% of frames, or not seen for over 1 second |
+
+Jitter is a robust standard deviation of position on the worst axis, after removing
+flips. A colour only changes once the new one has lasted 1 second. **Record** needs
+the reference row to be green. All of these limits are constants at the top of
+[src/gui.py](src/gui.py).
+
 The table shows a 1 second rolling median, so it's easier to read. A hidden tag keeps
 its value until it has been out of view for over 1 second. Only the display is
 filtered; nothing in the saved files is.
@@ -51,9 +66,9 @@ same minute gets a `_2` suffix, so nothing is overwritten:
 | `*_snapshot.png` | The first recorded frame, with tag outlines and axes |
 
 The GUI only shows tags listed under `objects` in the config, plus `reference_tag`
-if it's set, so add a new tag to the config before using it. Any listed tag can be
+and any tag in `tag_sizes_m`, so add a new tag to the config before using it. Any listed tag can be
 chosen as the reference. Each tag is handled individually: the config supplies the
-tag size, camera settings, decision margin, and display names, while multi-tag
+tag sizes, camera settings, decision margin, and display names, while multi-tag
 objects and their offsets aren't applied.
 
 CSV columns are `bush_id, cane_id, timestamp, reference_id, tag_id, name, x, y, z, qx, qy, qz, qw,
@@ -61,6 +76,19 @@ n_frames, n_rejected, pos_std_mm`, in metres with xyzw quaternions. Only frames
 showing both the tag and the reference are averaged. Frames whose rotation is more
 than 15 degrees from the tag's typical rotation are dropped first, and `n_rejected`
 counts them. `pos_std_mm` is the largest per-axis standard deviation.
+
+### A larger reference tag
+
+A bigger reference tag gives a steadier reference frame. Tags can have different
+sizes: `tag_size_m` is the default, and `tag_sizes_m` lists the exceptions by ID,
+each the edge length of the black square in metres:
+
+```yaml
+tag_size_m: 0.0254
+reference_tag: 10    # optional; preselects it in the GUI
+tag_sizes_m:
+  10: 0.100
+```
 
 ## Command-line recording
 

@@ -21,10 +21,19 @@ from scipy.spatial.transform import Rotation as R
 
 from src import capture
 from src.capture import CaptureWorker
-from src.config import CameraConfig, Config, TrackedObjectConfig
+from src.config import CameraConfig, Config, TrackedObjectConfig, load_config
 from src.data_collector import DataCollector
-from src.gui import exposure_to_slider, slider_to_exposure
-from src.measurement import RollingMedian, average_poses, build_output_paths, relative_pose
+from src.detection import TagPipeline
+from src import gui
+from src.gui import StatusHold, exposure_to_slider, judge_quality, slider_to_exposure
+from src.measurement import (
+    DetectionQuality,
+    RollingMedian,
+    TagQuality,
+    average_poses,
+    build_output_paths,
+    relative_pose,
+)
 
 FOCAL = 900.0
 WIDTH, HEIGHT = 1280, 720
@@ -184,6 +193,47 @@ def test_relative_pose_recovers_known_transform():
 
     assert position == pytest.approx(expected_position)
     assert rotation == pytest.approx(expected_rotation)
+
+
+def test_larger_tag_size_scales_only_that_tags_position():
+    """A tag with its own size is accepted and its distance scales with that size."""
+    config = make_config()
+    pipeline = TagPipeline(
+        config.build_trackers(),
+        (FOCAL, FOCAL, WIDTH / 2, HEIGHT / 2),
+        TAG_SIZE_M,
+        tag_sizes_m={7: TAG_SIZE_M * 4},
+    )
+    tags = pipeline.detect_tags(render({0: (400, 360), 7: (900, 360)}))
+
+    assert set(tags) == {0, 7}  # tag 7 isn't an object, but has a size, so it counts
+    # Same size in pixels, so the four-times larger tag must be four times further away.
+    assert tags[7].pose_t[2, 0] == pytest.approx(4 * tags[0].pose_t[2, 0], rel=0.02)
+    assert tags[0].pose_t[2, 0] == pytest.approx(
+        FOCAL * TAG_SIZE_M / TAG_PIXELS, rel=0.05
+    )  # the drawn marker has no white border, so it's all black square
+    np.testing.assert_allclose(tags[7].pose_R, tags[0].pose_R, atol=0.05)
+
+
+def write_yaml(tmp_path, extra):
+    """Write a minimal config file with extra lines and return its path."""
+    path = tmp_path / "config.yaml"
+    path.write_text("tag_size_m: 0.0254\nobjects:\n  - name: cane_0\n    tags:\n      - id: 0\n" + extra)
+    return path
+
+
+def test_config_reads_tag_sizes(tmp_path):
+    """tag_sizes_m is optional and maps tag IDs to sizes in metres."""
+    assert load_config(write_yaml(tmp_path, "")).tag_sizes_m == {}
+    config = load_config(write_yaml(tmp_path, "reference_tag: 10\ntag_sizes_m:\n  10: 0.1\n"))
+    assert config.tag_sizes_m == {10: 0.1}
+
+
+@pytest.mark.parametrize("extra", ["tag_sizes_m:\n  10: 0\n", "tag_sizes_m: 0.1\n"])
+def test_config_rejects_bad_tag_sizes(tmp_path, extra):
+    """A size must be positive, and tag_sizes_m must be a mapping."""
+    with pytest.raises(ValueError, match="tag_sizes_m"):
+        load_config(write_yaml(tmp_path, extra))
 
 
 def test_average_uses_all_frames_without_flips():
@@ -503,6 +553,98 @@ def test_rolling_median_ages_out_and_clears():
     rolling.add(1, 3.0, np.array([1.0, 0.0, 0.0]))
     rolling.clear()
     assert rolling.medians(3.0) == {}
+
+
+FLIPPED = R.from_euler("x", 40, degrees=True).as_matrix()
+
+
+def test_quality_of_steady_tag_seen_every_frame():
+    """A tag in every frame, unflipped, with 2 mm noise, scores near-perfect."""
+    rng = np.random.default_rng(0)
+    quality = DetectionQuality(window_seconds=2.0)
+    for index in range(20):
+        position = np.array([0.1, 0.0, 1.0]) + rng.normal(0, 0.002, 3)
+        quality.add_frame(index * 0.1, {1: (position, np.eye(3))})
+    result = quality.qualities(1.9)[1]
+
+    assert result.detected_fraction == 1.0
+    assert result.flip_fraction == 0.0
+    assert 1.0 < result.jitter_mm < 4.0
+    assert result.seconds_since_seen == pytest.approx(0.0)
+
+
+def test_quality_counts_missed_frames_flips_and_ignores_one_wild_frame():
+    """Detection share counts all frames; flips are counted; one far frame barely matters."""
+    quality = DetectionQuality(window_seconds=2.0)
+    for index in range(20):
+        poses = {2: (np.array([0.0, 0.0, 1.0]), np.eye(3))}
+        if index % 2 == 0:  # tag 1 in half the frames
+            rotation = FLIPPED if index in (0, 2) else np.eye(3)
+            x = 0.5 if index == 4 else 0.1  # one wild frame, not flipped
+            poses[1] = (np.array([x, 0.0, 1.0]), rotation)
+        quality.add_frame(index * 0.1, poses)
+    result = quality.qualities(1.9)[1]
+
+    assert result.detected_fraction == pytest.approx(0.5)
+    assert result.flip_fraction == pytest.approx(0.2)
+    assert result.jitter_mm == pytest.approx(0.0)
+
+
+def test_quality_ages_out_old_frames():
+    """Frames older than the window are forgotten, and so are tags with none left."""
+    quality = DetectionQuality(window_seconds=1.0)
+    quality.add_frame(0.0, {1: (np.zeros(3), np.eye(3))})
+    for index in range(1, 11):
+        quality.add_frame(index * 0.1, {})
+    assert quality.qualities(1.0)[1].seconds_since_seen == pytest.approx(1.0)
+    assert quality.qualities(1.5) == {}
+
+
+def make_quality(detected=1.0, flipped=0.0, jitter=3.0, since=0.0):
+    """Return a TagQuality with the given measures."""
+    return TagQuality(detected, flipped, jitter, since)
+
+
+@pytest.mark.parametrize(
+    "quality, status, text",
+    [
+        (None, gui.STATUS_NONE, ""),
+        (make_quality(since=gui.NOT_SEEN_SECONDS + 0.1), gui.STATUS_NONE, ""),
+        (make_quality(detected=gui.MIN_DETECTED - 0.05), gui.STATUS_NONE, ""),
+        (make_quality(), gui.STATUS_GOOD, "good, 3 mm"),
+        (make_quality(detected=0.5), gui.STATUS_FAIR, "seen 50%"),
+        (make_quality(flipped=0.3), gui.STATUS_FAIR, "flips 30%"),
+        (make_quality(jitter=gui.GREEN_MAX_JITTER_MM + 2), gui.STATUS_FAIR, "jitter 12 mm"),
+        (make_quality(jitter=None), gui.STATUS_FAIR, "few frames"),
+        (make_quality(detected=0.5, flipped=0.3), gui.STATUS_FAIR, "seen 50%, flips 30%"),
+    ],
+)
+def test_judge_quality(quality, status, text):
+    """Each measure has its own limit, and the text names what's wrong."""
+    assert judge_quality(quality) == (status, text)
+
+
+def test_status_hold_ignores_blips_and_follows_lasting_changes():
+    """A status must last the hold time before it's shown."""
+    hold = StatusHold(hold_seconds=1.0)
+    assert hold.update(1, "good", 0.0) == "good"  # a new row shows at once
+    assert hold.update(1, "fair", 0.2) == "good"
+    assert hold.update(1, "good", 0.4) == "good"  # blip over
+    assert hold.update(1, "fair", 0.5) == "good"
+    assert hold.update(1, "fair", 1.4) == "good"
+    assert hold.update(1, "fair", 1.5) == "fair"  # lasted 1 s
+    assert hold.update(1, "none", 1.6) == "fair"
+    assert hold.update(1, "good", 1.7) == "fair"  # a different change restarts the wait
+    assert hold.update(1, "good", 2.7) == "good"
+
+
+def test_worker_publishes_quality_for_every_visible_tag(worker):
+    """The worker reports detection quality, including for the reference."""
+    live = worker([{0: (300, 200), 1: (900, 200), 2: (600, 500)}])
+    wait_for(lambda: live.get_state() is not None and live.get_state().sequence > 5)
+    quality = live.get_state().quality
+    assert set(quality) == {0, 1, 2}
+    assert all(item.detected_fraction == 1.0 and item.flip_fraction == 0.0 for item in quality.values())
 
 
 def test_display_is_filtered_but_recorded_rows_stay_raw():

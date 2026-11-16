@@ -33,6 +33,7 @@ def main():
         tag_family=config.tag_family,
         decision_margin=config.decision_margin,
         reference_id=config.reference_tag,
+        tag_sizes_m=config.tag_sizes_m,
     )
 
     positions = {tracker.name: [] for tracker in trackers}
