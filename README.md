@@ -31,6 +31,10 @@ python -m src.gui --config config/example.yaml
 If the camera disconnects, the GUI keeps trying to reopen it every 2 seconds, using
 the same exposure. A recording in progress at the time is discarded.
 
+Detections with an impossible pose, such as a mirror-image rotation, are ignored. If
+a frame still can't be processed, it's skipped with a message in the status bar and
+the camera stays connected.
+
 If the camera stops responding without disconnecting, it needs unplugging and
 plugging back in. Closing the window still ends the program in that case: if the
 camera isn't released within 10 seconds, the program ends itself so the camera is
@@ -114,6 +118,40 @@ reference_tag: 10    # optional; preselects it in the GUI
 tag_sizes_m:
   10: 0.100
 ```
+
+## Reconstructing a cane
+
+A cane often takes several recordings to cover. To combine them into one position
+per tag relative to the reference:
+
+```bash
+python -m src.reconstruct --bush 12 --cane 3 --folder data
+```
+
+Leave out `--folder` to choose it in a window. The script:
+
+- Finds every `bush<B>_cane<C>_*_average.csv` in the folder.
+- Uses only rows with `well_detected` set to `True`, the tags that got a checkmark.
+- Combines each tag's recordings, weighted by frame count. `spread_mm` is how far the
+  furthest recording is from the combined position. Over 10 mm gives a warning, since
+  the cane or the reference may have moved between recordings.
+- Builds one reconstruction per day, since canes bend over the season. Use
+  `--date YYYYmmdd` to choose one day.
+- Only combines recordings with the same reference tag: the most used one, or the
+  one given with `--reference`.
+- Lists tags that were recorded but never well detected.
+
+Add `--plot` to draw the tags in 3D and open the plot in a window. Tags are joined
+in ID order (0 to 1, 1 to 2, ...), with a dashed line where tags in between are
+missing. The reference is a star at the origin, every axis has the same scale, and
+each day gets its own colour, so bending over the season shows up. The picture is
+also saved as `bush<B>_cane<C>_<dates>_reconstruction.png`. The axes are the
+reference tag's: x to the tag's right, y down the tag, and z into the tag.
+
+Each day is saved as `bush<B>_cane<C>_<YYYYmmdd>_reconstruction.csv` in the same
+folder, with the reference as a row at the origin. Recordings from before
+`well_detected` existed are skipped, unless you add `--include-unjudged` to use all
+their tags.
 
 ## Command-line recording
 

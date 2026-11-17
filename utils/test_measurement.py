@@ -231,6 +231,29 @@ def write_yaml(tmp_path, extra):
     return path
 
 
+def test_broken_poses_are_dropped():
+    """A mirror-image rotation, a non-finite value, or a tag behind the camera is rejected."""
+    pipeline = TagPipeline(
+        make_config().build_trackers(), (FOCAL, FOCAL, WIDTH / 2, HEIGHT / 2), TAG_SIZE_M
+    )
+    mirror = np.diag([1.0, 1.0, -1.0])
+
+    def fake(tag_id, rotation, position):
+        """Return a detection-like object."""
+        detection = FakePose(rotation, position)
+        detection.tag_id, detection.decision_margin = tag_id, 50.0
+        return detection
+
+    raw = [
+        fake(0, np.eye(3), [0, 0, 1]),
+        fake(1, mirror, [0, 0, 1]),
+        fake(2, np.full((3, 3), np.nan), [0, 0, 1]),
+        fake(3, np.eye(3), [0, 0, -1]),
+    ]
+    pipeline.detector = type("FakeDetector", (), {"detect": lambda self, *a, **k: raw})()
+    assert set(pipeline.detect_tags(np.zeros((4, 4, 3), np.uint8))) == {0}
+
+
 def test_config_reads_tag_sizes(tmp_path):
     """tag_sizes_m is optional and maps tag IDs to sizes in metres."""
     assert load_config(write_yaml(tmp_path, "")).tag_sizes_m == {}
@@ -390,6 +413,29 @@ def test_stop_during_recording_discards_and_releases_camera(worker, tmp_path):
 
     assert not list(tmp_path.iterdir())
     assert FakeCamera.instances[-1].closed
+
+
+def test_processing_error_skips_frame_without_reconnecting(worker, monkeypatch):
+    """A frame that can't be processed is skipped once reported; the camera stays open."""
+    calls = {"count": 0}
+    original = TagPipeline.detect_tags
+
+    def flaky(self, frame):
+        """Fail on a few frames, like a broken detection, then work normally."""
+        calls["count"] += 1
+        if 3 <= calls["count"] <= 6:
+            raise ValueError("Non-positive determinant")
+        return original(self, frame)
+
+    monkeypatch.setattr(TagPipeline, "detect_tags", flaky)
+    live = worker([{0: (300, 200), 1: (900, 200), 2: (600, 500)}])
+    wait_for(lambda: calls["count"] > 10 and live.get_state() is not None)
+
+    notices = [notice.text for notice in live.get_notices()]
+    assert len(FakeCamera.instances) == 1  # never reopened
+    assert live.is_connected()
+    assert sum("Skipped a frame" in text for text in notices) == 1  # reported once
+    assert not any("Camera lost" in text for text in notices)
 
 
 def test_lost_camera_reconnects(worker):

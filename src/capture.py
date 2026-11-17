@@ -38,6 +38,8 @@ REJECTED_WARNING_FRACTION = 0.2
 FPS_WINDOW_FRAMES = 30
 # Wait between attempts to reopen a lost camera.
 RECONNECT_DELAY_SECONDS = 2.0
+# Report frames that couldn't be processed at most this often.
+PROCESSING_ERROR_REPORT_SECONDS = 5.0
 # Default window for judging how well each tag is detected.
 QUALITY_WINDOW_SECONDS = 2.0
 
@@ -154,6 +156,7 @@ class CaptureWorker:
         self._pipeline = None
         self._connected = False
         self._ever_connected = False
+        self._last_processing_error_time = None
         self._open_failure_reported = False
 
     def start(self):
@@ -244,7 +247,7 @@ class CaptureWorker:
                     self._apply_exposure_request()
                     frame = self._camera.read()
                     if frame is not None:
-                        self._process_frame(frame)
+                        self._process_frame_safely(frame)
             except Exception as error:  # Reported, then the camera is reopened.
                 self._report_camera_error(error)
             finally:
@@ -337,6 +340,24 @@ class CaptureWorker:
         except Exception:
             pass
         self._camera = None
+
+    def _process_frame_safely(self, frame):
+        """Process a frame, skipping it if processing fails.
+
+        A processing error is a problem with this frame, not the camera, so the
+        camera is kept open. Treating it as a lost camera made the GUI keep
+        disconnecting and reconnecting while a bad frame's data was still in use.
+        """
+        try:
+            self._process_frame(frame)
+        except Exception as error:
+            now = time.monotonic()
+            last = self._last_processing_error_time
+            if last is None or now - last >= PROCESSING_ERROR_REPORT_SECONDS:
+                self._last_processing_error_time = now
+                self._notices.put(
+                    Notice(f"Skipped a frame that couldn't be processed ({error}).", is_error=True)
+                )
 
     def _process_frame(self, frame):
         """Detect tags, update any recording, and publish the display state."""

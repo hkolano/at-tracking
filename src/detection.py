@@ -5,10 +5,28 @@ import numpy as np
 from pupil_apriltags import Detector
 
 # pupil_apriltags 1.0.4 can crash the whole process (segmentation fault) when a
-# detector that used more than one thread is destroyed, for example when the GUI
-# closes. In testing, 2, 4 and 12 threads all crashed and 1 thread never did. One
-# thread takes about 74 ms per 1080p frame instead of about 43 ms with 12.
+# detector is destroyed, for example when the program exits. Detection itself has
+# been stable. More threads crashed more often in the test suite, but 1 thread also
+# crashed on busy outdoor images with quad_decimate=1. One thread takes about
+# 75-90 ms per 1080p frame instead of about 43 ms with 12.
 DETECTOR_THREADS = 1
+
+# The detector occasionally returns a broken pose, such as a mirror-image rotation,
+# for a poor detection. A real rotation's determinant is 1.
+ROTATION_DETERMINANT_TOLERANCE = 0.1
+
+
+def has_valid_pose(tag):
+    """Return True if a detection's pose is a real rotation in front of the camera."""
+    rotation = np.asarray(tag.pose_R, dtype=np.float64)
+    position = np.asarray(tag.pose_t, dtype=np.float64)
+    if rotation.shape != (3, 3) or position.size != 3:
+        return False
+    if not (np.all(np.isfinite(rotation)) and np.all(np.isfinite(position))):
+        return False
+    if abs(np.linalg.det(rotation) - 1.0) > ROTATION_DETERMINANT_TOLERANCE:
+        return False
+    return position.reshape(3)[2] > 0.0
 
 
 class TagPipeline:
@@ -104,6 +122,7 @@ class TagPipeline:
             for tag in raw_tags
             if tag.decision_margin > self.decision_margin
             and tag.tag_id in self.allowed_ids
+            and has_valid_pose(tag)
         }
         for tag_id, size in self.tag_sizes_m.items():
             if tag_id in tags:
