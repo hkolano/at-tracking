@@ -21,7 +21,7 @@ import pytest
 from scipy.spatial.transform import Rotation as R
 
 from src import capture
-from src.capture import CaptureWorker, RecordingResult
+from src.capture import CaptureWorker
 from src.config import CameraConfig, Config, TrackedObjectConfig, load_config
 from src.data_collector import DataCollector
 from src.detection import TagPipeline
@@ -29,13 +29,13 @@ from src import gui
 from src.gui import (
     StatusHold,
     exposure_to_slider,
-    judge_quality,
     slider_to_exposure,
 )
 from src.measurement import (
     DetectionQuality,
     QualityLimits,
     RecordingVerdict,
+    judge_quality,
     judge_recording,
     RollingMedian,
     TagQuality,
@@ -619,7 +619,7 @@ def test_quality_of_steady_tag_seen_every_frame():
     quality = DetectionQuality(window_seconds=2.0)
     for index in range(20):
         position = np.array([0.1, 0.0, 1.0]) + rng.normal(0, 0.002, 3)
-        quality.add_frame(index * 0.1, {1: (position, np.eye(3))})
+        quality.add_frame(index * 0.1, {1: FakePose(np.eye(3), position)})
     result = quality.qualities(1.9)[1]
 
     assert result.detected_fraction == 1.0
@@ -632,11 +632,11 @@ def test_quality_counts_missed_frames_flips_and_ignores_one_wild_frame():
     """Detection share counts all frames; flips are counted; one far frame barely matters."""
     quality = DetectionQuality(window_seconds=2.0)
     for index in range(20):
-        poses = {2: (np.array([0.0, 0.0, 1.0]), np.eye(3))}
+        poses = {2: FakePose(np.eye(3), [0.0, 0.0, 1.0])}
         if index % 2 == 0:  # tag 1 in half the frames
             rotation = FLIPPED if index in (0, 2) else np.eye(3)
             x = 0.5 if index == 4 else 0.1  # one wild frame, not flipped
-            poses[1] = (np.array([x, 0.0, 1.0]), rotation)
+            poses[1] = FakePose(rotation, [x, 0.0, 1.0])
         quality.add_frame(index * 0.1, poses)
     result = quality.qualities(1.9)[1]
 
@@ -648,7 +648,7 @@ def test_quality_counts_missed_frames_flips_and_ignores_one_wild_frame():
 def test_quality_ages_out_old_frames():
     """Frames older than the window are forgotten, and so are tags with none left."""
     quality = DetectionQuality(window_seconds=1.0)
-    quality.add_frame(0.0, {1: (np.zeros(3), np.eye(3))})
+    quality.add_frame(0.0, {1: FakePose(np.eye(3), np.zeros(3))})
     for index in range(1, 11):
         quality.add_frame(index * 0.1, {})
     assert quality.qualities(1.0)[1].seconds_since_seen == pytest.approx(1.0)
@@ -676,7 +676,7 @@ def make_quality(detected=1.0, flipped=0.0, jitter=3.0, since=0.0):
 )
 def test_judge_quality(quality, status, text):
     """Each measure has its own limit, and the text names what's wrong."""
-    assert judge_quality(quality) == (status, text)
+    assert judge_quality(quality, gui.QUALITY_LIMITS) == (status, text)
 
 
 def test_status_hold_ignores_blips_and_follows_lasting_changes():
@@ -720,6 +720,20 @@ def test_tag_without_a_csv_row_is_not_checked_off():
     assert judge({2: make_quality(), 0: make_quality()}, set()).well_detected == set()
 
 
+def test_long_recordings_find_flips_without_comparing_every_pair():
+    """Over MAX_CENTRAL_CANDIDATES samples, flips are still found exactly."""
+    rng = np.random.default_rng(1)
+    count = 2000
+    flipped = rng.random(count) < 0.1
+    rotations = R.from_euler("xyz", rng.normal(0, 1.0, (count, 3)), degrees=True).as_matrix()
+    rotations[flipped] = FLIPPED @ rotations[flipped]
+    positions = np.zeros((count, 3))
+
+    average = average_poses(positions, rotations)
+
+    assert average.n_rejected == int(flipped.sum())
+
+
 def test_gui_limits_reach_the_worker():
     """The GUI's constants are the limits it gives the worker."""
     assert gui.QUALITY_LIMITS.green_max_jitter_mm == gui.GREEN_MAX_JITTER_MM
@@ -727,25 +741,24 @@ def test_gui_limits_reach_the_worker():
 
 
 def record_once(live):
-    """Make one 0.5 s recording on a running worker and return its RecordingResult."""
+    """Make one 0.5 s recording on a running worker and return its notice, with the verdict."""
     wait_for(lambda: live.get_state() is not None and 2 in live.get_state().visible_ids)
+    live.get_notices()
     live.start_recording(0.5, "3", "12")
-    results = []
-    wait_for(lambda: results.extend(live.get_finished_recordings()) or results)
-    (result,) = results
-    return result
+    notices = []
+    wait_for(lambda: notices.extend(live.get_notices()) or any(n.verdict for n in notices))
+    (saved,) = [notice for notice in notices if notice.verdict is not None]
+    return saved
 
 
 def test_saved_recording_reports_and_stores_detection_quality(worker, tmp_path):
     """The verdict reaches the GUI, the CSV, and the Parquet metadata."""
     live = worker([{0: (300, 200), 1: (900, 200), 2: (600, 500)}])
-    assert live.get_finished_recordings() == []
-    result = record_once(live)
+    saved = record_once(live)
 
-    assert (result.bush_id, result.cane_id, result.reference_id) == ("3", "12", 2)
-    assert result.averaged_ids == {0, 1}
-    assert set(result.quality) == {0, 1, 2}
-    assert result.verdict.well_detected == {0, 1}
+    assert saved.text.startswith("Saved ") and not saved.is_error
+    assert saved.verdict.well_detected == {0, 1}
+    assert saved.verdict.problems == {} and saved.verdict.reference_problem == ""
 
     rows = read_rows(single_file(tmp_path, "*_average.csv"))
     for row in rows:
@@ -767,9 +780,9 @@ def test_poorly_detected_tag_is_saved_as_not_well_detected(worker, tmp_path):
     both = {0: (300, 200), 1: (900, 200), 2: (600, 500)}
     without_0 = {1: (900, 200), 2: (600, 500)}
     live = worker([both, without_0, without_0] * 20)
-    result = record_once(live)
+    verdict = record_once(live).verdict
 
-    assert 0 not in result.verdict.well_detected and 1 in result.verdict.well_detected
+    assert 0 not in verdict.well_detected and 1 in verdict.well_detected
     rows = {row["tag_id"]: row for row in read_rows(single_file(tmp_path, "*_average.csv"))}
     assert rows["0"]["well_detected"] == "False"
     assert float(rows["0"]["detected_pct"]) < 70

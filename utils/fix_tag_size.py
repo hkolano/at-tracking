@@ -16,44 +16,30 @@ Run from the repository root, for example:
 
 import argparse
 import csv
-import json
 import shutil
 from pathlib import Path
 
 import numpy as np
-import pyarrow as pa
-import pyarrow.parquet as pq
 from scipy.spatial.transform import Rotation as R
 
+from src.data_collector import read_tracking_parquet, write_tracking_parquet
 from src.measurement import (
+    AVERAGE_SUFFIX,
+    FRAMES_SUFFIX,
     QualityLimits,
     TagQuality,
     average_poses,
     judge_recording,
     quality_columns,
+    relative_transform,
+    row_pose,
+    tag_name,
     write_average_csv,
 )
 
 BACKUP_DIR_NAME = "before_tag_size_fix"
 POSITION_TOLERANCE_M = 1e-5  # CSVs store 6 decimals, so 1e-6 m rounding.
 QUATERNION_TOLERANCE = 1e-4
-
-
-def read_recording(parquet_path):
-    """Return a recording's frames as a DataFrame, and its metadata dict."""
-    table = pq.read_table(parquet_path)
-    metadata = json.loads(table.schema.metadata[b"dataset_metadata"])
-    return table.to_pandas(), metadata
-
-
-def write_recording(parquet_path, frames, metadata):
-    """Write frames and metadata to Parquet in the same layout as DataCollector."""
-    table = pa.Table.from_pandas(frames, preserve_index=False)
-    schema_metadata = dict(table.schema.metadata or {})
-    schema_metadata[b"dataset_metadata"] = json.dumps(
-        metadata, sort_keys=True, default=str
-    ).encode("utf-8")
-    pq.write_table(table.replace_schema_metadata(schema_metadata), parquet_path)
 
 
 def average_relative_poses(frames, reference_name, tag_ids):
@@ -67,21 +53,32 @@ def average_relative_poses(frames, reference_name, tag_ids):
     Returns:
         dict of tag_id -> AveragedPose, as the GUI computes it.
     """
-    positions, rotations = {}, {}
-    for _, frame in frames.groupby("timestamp", sort=True):
-        reference_rows = frame[frame["name"] == reference_name]
-        if reference_rows.empty:
-            continue
-        reference = reference_rows.iloc[0]
-        reference_rotation = R.from_quat(reference[["qx", "qy", "qz", "qw"]].to_numpy(float)).as_matrix()
-        reference_position = reference[["x", "y", "z"]].to_numpy(float)
-        for _, row in frame[frame["name"] != reference_name].iterrows():
-            rotation = R.from_quat(row[["qx", "qy", "qz", "qw"]].to_numpy(float)).as_matrix()
-            position = row[["x", "y", "z"]].to_numpy(float)
-            tag_id = tag_ids[row["name"]]
-            positions.setdefault(tag_id, []).append(reference_rotation.T @ (position - reference_position))
-            rotations.setdefault(tag_id, []).append(reference_rotation.T @ rotation)
-    return {tag_id: average_poses(positions[tag_id], rotations[tag_id]) for tag_id in positions}
+    columns = ["x", "y", "z", "qx", "qy", "qz", "qw"]
+    reference = frames.loc[frames["name"] == reference_name, ["timestamp", *columns]]
+    reference = reference.drop_duplicates("timestamp")
+    others = frames[frames["name"] != reference_name]
+    # Each tag row next to the reference row from the same frame, in time order.
+    paired = others.merge(reference, on="timestamp", suffixes=("", "_ref"))
+    paired = paired.sort_values("timestamp", kind="stable")
+    if paired.empty:
+        return {}
+
+    def pose_arrays(suffix):
+        """Return stacked rotation matrices and positions for one side of the pairs."""
+        quaternions = paired[[f"{key}{suffix}" for key in ("qx", "qy", "qz", "qw")]].to_numpy(float)
+        positions = paired[[f"{axis}{suffix}" for axis in ("x", "y", "z")]].to_numpy(float)
+        return R.from_quat(quaternions).as_matrix(), positions
+
+    reference_rotations, reference_positions = pose_arrays("_ref")
+    rotations, positions = pose_arrays("")
+    relative_positions, relative_rotations = relative_transform(
+        reference_rotations, reference_positions, rotations, positions
+    )
+    names = paired["name"].to_numpy()
+    return {
+        tag_ids[name]: average_poses(relative_positions[names == name], relative_rotations[names == name])
+        for name in dict.fromkeys(names)
+    }
 
 
 def rescale_detection(metadata, tag_id, scale, reference_id, averaged_ids):
@@ -127,8 +124,7 @@ def matches_csv(averages, csv_rows):
         return False
     for tag_id, average in averages.items():
         row = csv_rows[tag_id]
-        position = np.array([float(row[axis]) for axis in "xyz"])
-        quaternion = np.array([float(row[key]) for key in ("qx", "qy", "qz", "qw")])
+        position, quaternion = row_pose(row)
         if np.abs(position - average.position).max() > POSITION_TOLERANCE_M:
             return False
         # q and -q are the same rotation.
@@ -143,41 +139,38 @@ def matches_csv(averages, csv_rows):
 def fix_recording(parquet_path, tag_id, recorded_size, true_size, dry_run=False):
     """Rescale one tag's positions in a recording and rebuild its average CSV."""
     parquet_path = Path(parquet_path)
-    csv_path = parquet_path.with_name(parquet_path.name.replace("_frames.parquet", "_average.csv"))
-    frames, metadata = read_recording(parquet_path)
+    csv_path = parquet_path.with_name(parquet_path.name.replace(FRAMES_SUFFIX, AVERAGE_SUFFIX))
+    frames, metadata = read_tracking_parquet(parquet_path)
     csv_rows = read_csv_rows(csv_path)
 
     recorded_sizes = metadata.get("tag_sizes_m") or {}
-    if str(tag_id) in recorded_sizes:
-        size_in_file = recorded_sizes[str(tag_id)]
-    else:
-        size_in_file = metadata["tag_size_m"]
+    size_in_file = recorded_sizes.get(str(tag_id), metadata["tag_size_m"])
     if not np.isclose(size_in_file, recorded_size):
         raise SystemExit(
             f"{parquet_path}: tag {tag_id} was recorded at {size_in_file} m, not "
             f"{recorded_size} m. Nothing changed. Already fixed?"
         )
 
-    tag_ids = {name: int(key) for key, name in metadata["tag_names"].items()}
-    tag_name = metadata["tag_names"].get(str(tag_id), f"tag_{tag_id}")
-    tag_ids.setdefault(tag_name, tag_id)
+    names_in_file = {int(key): name for key, name in metadata["tag_names"].items()}
+    tag_ids = {name: key for key, name in names_in_file.items()}
+    fixed_name = tag_name(names_in_file, tag_id)
+    tag_ids.setdefault(fixed_name, tag_id)
     reference_id = metadata["reference_tag_id"]
-    reference_name = metadata["tag_names"].get(str(reference_id), f"tag_{reference_id}")
+    reference_name = tag_name(names_in_file, reference_id)
 
     # Check the averaging is rebuilt exactly as the GUI did it before changing anything.
     if not matches_csv(average_relative_poses(frames, reference_name, tag_ids), csv_rows):
         raise SystemExit(f"{csv_path}: couldn't reproduce the existing CSV. Nothing changed.")
 
-    is_tag = frames["name"] == tag_name
-    frames.loc[is_tag, ["x", "y", "z"]] *= true_size / recorded_size
+    scale = true_size / recorded_size
+    is_tag = frames["name"] == fixed_name
+    frames.loc[is_tag, ["x", "y", "z"]] *= scale
     averages = average_relative_poses(frames, reference_name, tag_ids)
-    detection = rescale_detection(
-        metadata, tag_id, true_size / recorded_size, reference_id, set(averages)
-    )
+    detection = rescale_detection(metadata, tag_id, scale, reference_id, set(averages))
 
-    print(f"{parquet_path.name}: {int(is_tag.sum())} rows of {tag_name} rescaled")
+    print(f"{parquet_path.name}: {int(is_tag.sum())} rows of {fixed_name} rescaled")
     for tag, average in sorted(averages.items()):
-        old = [float(csv_rows[tag][axis]) for axis in "xyz"]
+        old, _ = row_pose(csv_rows[tag])
         print(f"  tag {tag}: x, y, z {np.round(old, 3)} -> {np.round(average.position, 3)} m")
     if dry_run:
         return
@@ -200,7 +193,7 @@ def fix_recording(parquet_path, tag_id, recorded_size, true_size, dry_run=False)
         f"tag {tag_id} positions rescaled from a {recorded_size} m to a {true_size} m tag "
         f"by utils/fix_tag_size.py; originals in {BACKUP_DIR_NAME}/"
     )
-    write_recording(parquet_path, frames, metadata)
+    write_tracking_parquet(parquet_path, frames, metadata)
 
     first_row = next(iter(csv_rows.values()))
     names = {tag: row["name"] for tag, row in csv_rows.items()}

@@ -35,10 +35,7 @@ def _build_metadata(config, camera, trackers):
         "reference_tag_id": config.reference_tag,
         "position_unit": "m",
         "quaternion_order": "xyzw",
-        "tag_family": config.tag_family,
-        "tag_size_m": config.tag_size_m,
-        "tag_sizes_m": {str(tag_id): size for tag_id, size in config.tag_sizes_m.items()},
-        "decision_margin_threshold": config.decision_margin,
+        **config.detection_metadata(),
         "camera": {
             "stream": "color",
             "width": config.camera.width,

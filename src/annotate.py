@@ -3,6 +3,8 @@
 import cv2
 import numpy as np
 
+from src.measurement import tag_name
+
 # BGR colors used for on-screen overlays.
 COLOR_TAG_OUTLINE = (0, 255, 0)
 COLOR_AXIS_X = (0, 0, 255)
@@ -84,7 +86,7 @@ def draw_tag_axes(
         center_x, center_y = tag.center.astype(np.int32)
         cv2.putText(
             frame,
-            names.get(tag_id, f"tag_{tag_id}"),
+            tag_name(names, tag_id),
             (int(center_x) + 10, int(center_y) + 25),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,

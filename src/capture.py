@@ -30,6 +30,7 @@ from src.measurement import (
     build_output_paths,
     clean_id,
     relative_pose,
+    tag_name,
     write_average_csv,
 )
 
@@ -68,18 +69,9 @@ class Notice:
 
     text: str
     is_error: bool = False
-
-
-@dataclass(frozen=True)
-class RecordingResult:
-    """How well each tag was detected over one saved recording."""
-
-    bush_id: str
-    cane_id: str
-    reference_id: int
-    quality: dict          # tag_id -> TagQuality over the whole recording, camera frame
-    averaged_ids: frozenset  # tags with a row in the CSV
-    verdict: object        # RecordingVerdict: which tags were well detected, and why not
+    # For a saved recording: its RecordingVerdict, so the GUI can check off tags
+    # in the same message.
+    verdict: object = None
 
 
 @dataclass
@@ -133,7 +125,6 @@ class CaptureWorker:
         self._stop_requested = threading.Event()
         self._thread = threading.Thread(target=self._run, name="capture", daemon=True)
         self._notices = queue.Queue()
-        self._results = queue.Queue()
 
         self._reference_id = config.reference_tag
         self._recording_request = None  # (seconds, bush_id, cane_id) waiting for the next frame
@@ -228,15 +219,6 @@ class CaptureWorker:
                 notices.append(self._notices.get_nowait())
             except queue.Empty:
                 return notices
-
-    def get_finished_recordings(self):
-        """Return and clear the RecordingResults of recordings saved since the last call."""
-        results = []
-        while True:
-            try:
-                results.append(self._results.get_nowait())
-            except queue.Empty:
-                return results
 
     def _run(self):
         """Process frames until stopped, reopening the camera whenever it is lost."""
@@ -411,9 +393,10 @@ class CaptureWorker:
                     position, _ = relative_pose(tag_dict[reference_id], tag)
                     self._position_filter.add(tag_id, now, position)
 
-        self._quality.add_frame(
-            now, {tag_id: (tag.pose_t, tag.pose_R) for tag_id, tag in tag_dict.items()}
-        )
+        self._quality.add_frame(now, tag_dict)
+        # Computed before taking the lock, so the GUI never waits on them.
+        relative_positions = self._position_filter.medians(now)
+        quality = self._quality.qualities(now)
 
         with self._lock:
             previous = self._state.sequence if self._state is not None else 0
@@ -423,8 +406,8 @@ class CaptureWorker:
                 fps=fps,
                 visible_ids=frozenset(tag_dict),
                 seen_ids=tuple(sorted(self._seen_ids)),
-                relative_positions=self._position_filter.medians(now),
-                quality=self._quality.qualities(now),
+                relative_positions=relative_positions,
+                quality=quality,
                 reference_id=reference_id,
                 recording_remaining=remaining,
                 exposure_range=self._exposure_range,
@@ -469,10 +452,7 @@ class CaptureWorker:
             "requested_seconds": seconds,
             "position_unit": "m",
             "quaternion_order": "xyzw",
-            "tag_family": self.config.tag_family,
-            "tag_size_m": self.config.tag_size_m,
-            "tag_sizes_m": {str(tag_id): size for tag_id, size in self.config.tag_sizes_m.items()},
-            "decision_margin_threshold": self.config.decision_margin,
+            **self.config.detection_metadata(),
             "tag_names": {str(tag_id): name for tag_id, name in self.names.items()},
             "camera": {
                 "stream": "color",
@@ -490,16 +470,14 @@ class CaptureWorker:
         """Add one frame's raw rows, and its poses relative to the reference."""
         recording = self._recording
         reference_tag = tag_dict.get(recording.reference_id)
-        recording.quality.add_frame(
-            timestamp, {tag_id: (tag.pose_t, tag.pose_R) for tag_id, tag in tag_dict.items()}
-        )
+        recording.quality.add_frame(timestamp, tag_dict)
 
         for tag_id, tag in tag_dict.items():
             recording.seen_ids.add(tag_id)
             x, y, z = tag.pose_t.reshape(3)
             quaternion = R.from_matrix(tag.pose_R).as_quat()
             recording.collector.update(
-                timestamp, self.names.get(tag_id, f"tag_{tag_id}"), x, y, z, *quaternion
+                timestamp, tag_name(self.names, tag_id), x, y, z, *quaternion
             )
 
             if reference_tag is not None and tag_id != recording.reference_id:
@@ -515,8 +493,7 @@ class CaptureWorker:
                 tag_id: average_poses(recording.positions[tag_id], recording.rotations[tag_id])
                 for tag_id in recording.positions
             }
-            result = self._recording_result(recording, averages)
-            well_detected = result.verdict.well_detected
+            quality, verdict = self._judge_recording(recording, averages)
             paths = build_output_paths(
                 self.output_dir,
                 recording.bush_id,
@@ -532,7 +509,7 @@ class CaptureWorker:
                 averages,
                 self.names,
                 detection={
-                    tag_id: quality_columns(result.quality.get(tag_id), tag_id in well_detected)
+                    tag_id: quality_columns(quality.get(tag_id), tag_id in verdict.well_detected)
                     for tag_id in averages
                 },
             )
@@ -541,7 +518,7 @@ class CaptureWorker:
                 metadata={
                     "capture_end_timestamp": time.time(),
                     "row_count": len(recording.collector.rows),
-                    **self._quality_metadata(result),
+                    **self._quality_metadata(quality, verdict),
                 },
             )
             if not cv2.imwrite(str(paths.snapshot), recording.snapshot):
@@ -549,42 +526,35 @@ class CaptureWorker:
         except Exception as error:  # Usually a full disk; the GUI must keep running.
             self._notices.put(Notice(f"Save failed: {error}", is_error=True))
         else:
-            self._notices.put(Notice(f"Saved {paths.csv} and its frames and snapshot."))
-            for warning in self._recording_warnings(recording, averages):
-                self._notices.put(Notice(warning, is_error=True))
-            # After the notices, so the GUI can add its checklist message to theirs.
-            self._results.put(result)
+            # One notice, so the GUI shows the save, any warnings and the checklist together.
+            warnings = self._recording_warnings(recording, averages)
+            text = "  ".join([f"Saved {paths.csv} and its frames and snapshot.", *warnings])
+            self._notices.put(Notice(text, is_error=bool(warnings), verdict=verdict))
         finally:
             with self._lock:
                 self._recording = None
 
-    def _recording_result(self, recording, averages):
-        """Summarize how well each tag was detected over a finished recording."""
+    def _judge_recording(self, recording, averages):
+        """Return each tag's quality over a finished recording, and the RecordingVerdict."""
         frame_times = recording.quality.frame_times
         quality = recording.quality.qualities(frame_times[-1]) if frame_times else {}
-        return RecordingResult(
-            bush_id=recording.bush_id,
-            cane_id=recording.cane_id,
-            reference_id=recording.reference_id,
-            quality=quality,
-            averaged_ids=frozenset(averages),
-            verdict=judge_recording(quality, recording.reference_id, averages, self.quality_limits),
-        )
+        verdict = judge_recording(quality, recording.reference_id, averages, self.quality_limits)
+        return quality, verdict
 
-    def _quality_metadata(self, result):
+    def _quality_metadata(self, quality, verdict):
         """Return the Parquet metadata describing how well each tag was detected."""
         return {
             "quality_limits": asdict(self.quality_limits),
-            "well_detected_tag_ids": sorted(result.verdict.well_detected),
-            "reference_problem": result.verdict.reference_problem,
+            "well_detected_tag_ids": sorted(verdict.well_detected),
+            "reference_problem": verdict.reference_problem,
             "detection_quality": {
                 str(tag_id): {
-                    "detected_fraction": quality.detected_fraction,
-                    "flip_fraction": quality.flip_fraction,
-                    "jitter_mm": quality.jitter_mm,
-                    "well_detected": tag_id in result.verdict.well_detected,
+                    "detected_fraction": tag_quality.detected_fraction,
+                    "flip_fraction": tag_quality.flip_fraction,
+                    "jitter_mm": tag_quality.jitter_mm,
+                    "well_detected": tag_id in verdict.well_detected,
                 }
-                for tag_id, quality in sorted(result.quality.items())
+                for tag_id, tag_quality in sorted(quality.items())
             },
         }
 

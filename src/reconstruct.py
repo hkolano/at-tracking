@@ -25,7 +25,7 @@ from pathlib import Path
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
-from src.measurement import clean_id
+from src.measurement import AVERAGE_SUFFIX, recording_stem, row_pose
 
 # Warn when a tag's recordings disagree by more than this, which suggests the cane
 # or the reference moved between recordings.
@@ -78,8 +78,7 @@ class Reconstruction:
 
 def find_recordings(folder, bush_id, cane_id):
     """Return the average CSVs for one bush and cane in a folder, oldest first."""
-    stem = f"bush{clean_id(str(bush_id))}_cane{clean_id(str(cane_id))}_"
-    return sorted(Path(folder).glob(f"{stem}*_average.csv"))
+    return sorted(Path(folder).glob(f"{recording_stem(bush_id, cane_id)}_*{AVERAGE_SUFFIX}"))
 
 
 def read_recording(path, include_unjudged=False):
@@ -111,13 +110,14 @@ def read_recording(path, include_unjudged=False):
         if judged and row["well_detected"] != "True":
             rejected[tag_id] = row["name"]
             continue
+        position, quaternion = row_pose(row)
         usable.append(Measurement(
             recording=path.name,
             reference_id=int(row["reference_id"]),
             tag_id=tag_id,
             name=row["name"],
-            position=np.array([float(row[axis]) for axis in "xyz"]),
-            quaternion=np.array([float(row[key]) for key in ("qx", "qy", "qz", "qw")]),
+            position=position,
+            quaternion=quaternion,
             n_frames=int(row["n_frames"]),
         ))
     return date, usable, rejected, warning
@@ -210,7 +210,7 @@ def write_reconstruction_csv(path, bush_id, cane_id, result):
         writer.writerow(RECONSTRUCTION_COLUMNS)
         writer.writerow([
             bush_id, cane_id, result.date, result.reference_id, result.reference_id,
-            "reference", *["0.000000"] * 3, "0.000000", "0.000000", "0.000000", "1.000000",
+            "reference", *["0.000000"] * 6, "1.000000",
             len(result.recordings), "", "", ";".join(result.recordings),
         ])
         for estimate in result.tags.values():
@@ -370,7 +370,7 @@ def main():
     for result in reconstructions:
         print_reconstruction(result)
         output = Path(folder) / (
-            f"bush{clean_id(args.bush)}_cane{clean_id(args.cane)}_{result.date}_reconstruction.csv"
+            f"{recording_stem(args.bush, args.cane)}_{result.date}_reconstruction.csv"
         )
         write_reconstruction_csv(output, args.bush, args.cane, result)
         print(f"  Saved {output}")
@@ -378,7 +378,7 @@ def main():
     if args.plot:
         dates = [result.date for result in reconstructions]
         span = dates[0] if len(dates) == 1 else f"{dates[0]}-{dates[-1]}"
-        stem = f"bush{clean_id(args.bush)}_cane{clean_id(args.cane)}_{span}"
+        stem = f"{recording_stem(args.bush, args.cane)}_{span}"
         picture = Path(folder) / f"{stem}_reconstruction.png"
         title = f"Bush {args.bush}, cane {args.cane}"
         print(f"\nSaved {picture}. Close the plot window to finish.")

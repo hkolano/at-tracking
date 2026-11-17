@@ -15,6 +15,28 @@ import pyarrow.parquet as pq
 
 
 TRACKING_COLUMNS = ["timestamp", "name", "x", "y", "z", "qx", "qy", "qz", "qw"]
+METADATA_KEY = b"dataset_metadata"
+
+
+def write_tracking_parquet(filename, frames, metadata):
+    """Write tracking rows with JSON metadata in the Parquet footer.
+
+    Args:
+        filename: Output path.
+        frames:   DataFrame with TRACKING_COLUMNS.
+        metadata: dict stored as JSON under METADATA_KEY.
+    """
+    table = pa.Table.from_pandas(frames, preserve_index=False)
+    schema_metadata = dict(table.schema.metadata or {})
+    schema_metadata[METADATA_KEY] = json.dumps(metadata, sort_keys=True, default=str).encode("utf-8")
+    Path(filename).parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(table.replace_schema_metadata(schema_metadata), filename)
+
+
+def read_tracking_parquet(filename):
+    """Return a recording's rows as a DataFrame, and its metadata dict."""
+    table = pq.read_table(filename)
+    return table.to_pandas(), json.loads(table.schema.metadata[METADATA_KEY])
 
 
 class DataCollector:
@@ -30,20 +52,14 @@ class DataCollector:
 
     def dump(self, filename="output.parquet", metadata=None):
         """Write long-form tracker poses with JSON metadata in the Parquet footer."""
-        df = pd.DataFrame(self.rows, columns=TRACKING_COLUMNS)
-        table = pa.Table.from_pandas(df, preserve_index=False)
         file_metadata = dict(self.metadata)
         file_metadata.update(metadata or {})
         file_metadata.setdefault("created_utc", datetime.now(timezone.utc).isoformat())
         file_metadata.setdefault("timestamp_clock", "Unix wall clock from time.time()")
         file_metadata.setdefault("timestamp_unit", "seconds")
-        schema_metadata = dict(table.schema.metadata or {})
-        schema_metadata[b"dataset_metadata"] = json.dumps(
-            file_metadata, sort_keys=True, default=str
-        ).encode("utf-8")
-        table = table.replace_schema_metadata(schema_metadata)
-        Path(filename).parent.mkdir(parents=True, exist_ok=True)
-        pq.write_table(table, filename)
+        write_tracking_parquet(
+            filename, pd.DataFrame(self.rows, columns=TRACKING_COLUMNS), file_metadata
+        )
 
 
 def summarize(filename):

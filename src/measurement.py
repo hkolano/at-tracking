@@ -3,7 +3,7 @@
 import csv
 import re
 from collections import deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -14,6 +14,14 @@ DISPLAY_FILTER_SECONDS = 1.0
 
 # Frames further than this from a tag's typical rotation count as orientation flips.
 ROTATION_OUTLIER_DEG = 15.0
+# The typical rotation is chosen from at most this many evenly spaced samples, so long
+# recordings don't need an all-pairs comparison (which grows with the square).
+MAX_CENTRAL_CANDIDATES = 200
+
+# Recording file names: <stem>_<YYYYmmdd>_<HHMM>[_n]<suffix>.
+AVERAGE_SUFFIX = "_average.csv"
+FRAMES_SUFFIX = "_frames.parquet"
+SNAPSHOT_SUFFIX = "_snapshot.png"
 
 CSV_COLUMNS = [
     "bush_id", "cane_id", "timestamp", "reference_id", "tag_id", "name",
@@ -97,22 +105,26 @@ class DetectionQuality:
         """Start with no frames."""
         self.window_seconds = window_seconds
         self.frame_times = deque()
-        self.samples = {}  # tag_id -> deque of (time, position, rotation matrix)
+        self.samples = {}  # tag_id -> deque of (time, position, quaternion xyzw)
 
-    def add_frame(self, now, poses):
+    def add_frame(self, now, detections):
         """Add one frame's detections.
 
         Args:
-            now:   Frame time in seconds.
-            poses: dict of tag_id -> (position, rotation matrix), in the camera frame.
-                   Tags missing from it count as not detected in this frame.
+            now:        Frame time in seconds.
+            detections: dict of tag_id -> detection with pose_t and pose_R, in the
+                        camera frame. Tags missing from it count as not detected.
         """
         self.frame_times.append(now)
-        for tag_id, (position, rotation) in poses.items():
-            self.samples.setdefault(tag_id, deque()).append(
-                (now, np.asarray(position, dtype=np.float64).reshape(3),
-                 np.asarray(rotation, dtype=np.float64))
-            )
+        if not detections:
+            return
+        # One conversion per frame, rather than one per sample every time it's judged.
+        quaternions = R.from_matrix(
+            np.array([detection.pose_R for detection in detections.values()], dtype=np.float64)
+        ).as_quat()
+        for (tag_id, detection), quaternion in zip(detections.items(), quaternions):
+            position = np.asarray(detection.pose_t, dtype=np.float64).reshape(3)
+            self.samples.setdefault(tag_id, deque()).append((now, position, quaternion))
 
     def qualities(self, now):
         """Return tag_id -> TagQuality for tags detected within the window."""
@@ -132,8 +144,8 @@ class DetectionQuality:
     def _quality(self, tag_samples, now):
         """Summarize one tag's detections in the window."""
         positions = np.array([position for _, position, _ in tag_samples])
-        rotations = R.from_matrix(np.array([rotation for _, _, rotation in tag_samples]))
-        flipped = _typical_rotation_angles(rotations) > ROTATION_OUTLIER_DEG
+        quaternions = np.array([quaternion for _, _, quaternion in tag_samples])
+        flipped = _typical_rotation_angles(quaternions) > ROTATION_OUTLIER_DEG
 
         kept = positions[~flipped]
         jitter_mm = None
@@ -153,26 +165,34 @@ class DetectionQuality:
 
 @dataclass(frozen=True)
 class QualityLimits:
-    """Limits for judging a tag's detection. See the constants at the top of gui.py."""
+    """Limits for judging a tag's detection.
+
+    The GUI sets these from the constants at the top of gui.py; the defaults here
+    match them, for code that runs without the GUI.
+    """
 
     min_detected: float = 0.20         # below this share of frames: not detected
     green_min_detected: float = 0.70   # share of frames
     green_max_flipped: float = 0.15    # share of detections
     green_max_jitter_mm: float = 10.0
-    not_seen_seconds: float = 1.0      # live view only; ignored for whole recordings
+    not_seen_seconds: float = 1.0      # live view only; see judge_quality
 
 
 def judge_quality(quality, limits):
+    """Judge a tag's live detection: like judge_detection, but not seen recently is none."""
+    if quality is not None and quality.seconds_since_seen > limits.not_seen_seconds:
+        return STATUS_NONE, ""
+    return judge_detection(quality, limits)
+
+
+def judge_detection(quality, limits):
     """Return (status, text) for a TagQuality, or for None if the tag isn't detected.
 
-    The text is short enough for the GUI table: the jitter when the tag is good, or
-    what keeps it from being good.
+    How recently the tag was seen isn't considered, so this also judges whole
+    recordings. The text is short enough for the GUI table: the jitter when the tag
+    is good, or what keeps it from being good.
     """
-    if (
-        quality is None
-        or quality.seconds_since_seen > limits.not_seen_seconds
-        or quality.detected_fraction < limits.min_detected
-    ):
+    if quality is None or quality.detected_fraction < limits.min_detected:
         return STATUS_NONE, ""
 
     problems = []
@@ -213,10 +233,7 @@ def judge_recording(quality, reference_id, averaged_ids, limits):
     """
     def judge(tag_id):
         """Judge one tag over the recording."""
-        tag_quality = quality.get(tag_id)
-        if tag_quality is not None:
-            tag_quality = replace(tag_quality, seconds_since_seen=0.0)
-        status, text = judge_quality(tag_quality, limits)
+        status, text = judge_detection(quality.get(tag_id), limits)
         return status, text or "rarely seen"
 
     reference_status, reference_text = judge(reference_id)
@@ -246,29 +263,45 @@ def quality_columns(quality, well_detected):
     ]
 
 
+def relative_transform(reference_rotation, reference_position, rotation, position):
+    """Return a pose's position and rotation in a reference pose's frame.
+
+    Works on one pose, with (3, 3) rotations and (3,) positions, or on stacks of
+    them with matching leading axes.
+    """
+    reference_inverse = np.swapaxes(reference_rotation, -1, -2)
+    relative_position = (reference_inverse @ (position - reference_position)[..., None])[..., 0]
+    return relative_position, reference_inverse @ rotation
+
+
 def relative_pose(reference_tag, tag):
     """Return a tag's position and rotation in the reference tag's frame."""
-    reference_rotation = np.asarray(reference_tag.pose_R, dtype=np.float64)
-    reference_position = np.asarray(reference_tag.pose_t, dtype=np.float64).reshape(3)
-    tag_rotation = np.asarray(tag.pose_R, dtype=np.float64)
-    tag_position = np.asarray(tag.pose_t, dtype=np.float64).reshape(3)
-
-    position = reference_rotation.T @ (tag_position - reference_position)
-    rotation = reference_rotation.T @ tag_rotation
-    return position, rotation
+    return relative_transform(
+        np.asarray(reference_tag.pose_R, dtype=np.float64),
+        np.asarray(reference_tag.pose_t, dtype=np.float64).reshape(3),
+        np.asarray(tag.pose_R, dtype=np.float64),
+        np.asarray(tag.pose_t, dtype=np.float64).reshape(3),
+    )
 
 
-def _typical_rotation_angles(rotations):
+def _typical_rotation_angles(quaternions):
     """Return each rotation's angle, in degrees, from the most central sample.
 
     The most central sample is used instead of the mean because flipped frames
-    pull the mean towards them.
+    pull the mean towards them. It's chosen from at most MAX_CENTRAL_CANDIDATES
+    evenly spaced samples; with fewer samples than that, every one is considered.
+
+    Args:
+        quaternions: (N, 4) xyzw quaternions.
     """
-    quaternions = rotations.as_quat()
-    alignment = np.clip(np.abs(quaternions @ quaternions.T), 0.0, 1.0)
-    pairwise_angles = 2.0 * np.arccos(alignment)
-    central_index = np.argmin(np.median(pairwise_angles, axis=1))
-    return np.degrees(pairwise_angles[central_index])
+    count = len(quaternions)
+    candidates = quaternions
+    if count > MAX_CENTRAL_CANDIDATES:
+        candidates = quaternions[np.linspace(0, count - 1, MAX_CENTRAL_CANDIDATES).round().astype(int)]
+    alignment = np.clip(np.abs(candidates @ quaternions.T), 0.0, 1.0)
+    angles = 2.0 * np.arccos(alignment)
+    central = np.argmin(np.median(angles, axis=1))
+    return np.degrees(angles[central])
 
 
 def average_poses(positions, rotations):
@@ -286,7 +319,7 @@ def average_poses(positions, rotations):
 
     positions = np.asarray(positions, dtype=np.float64)
     all_rotations = R.from_matrix(np.asarray(rotations, dtype=np.float64))
-    keep = _typical_rotation_angles(all_rotations) <= ROTATION_OUTLIER_DEG
+    keep = _typical_rotation_angles(all_rotations.as_quat()) <= ROTATION_OUTLIER_DEG
 
     kept_positions = positions[keep]
     return AveragedPose(
@@ -303,19 +336,35 @@ def clean_id(value):
     return re.sub(r"[^A-Za-z0-9_-]+", "_", value).strip("_")
 
 
+def recording_stem(bush_id, cane_id):
+    """Return the start of every file name for one bush and cane."""
+    return f"bush{clean_id(str(bush_id))}_cane{clean_id(str(cane_id))}"
+
+
+def tag_name(names, tag_id):
+    """Return a tag's display name, or tag_<id> if it has none."""
+    return names.get(tag_id, f"tag_{tag_id}")
+
+
+def row_pose(row):
+    """Return the (3,) position and (4,) xyzw quaternion from an average CSV row."""
+    position = np.array([float(row[axis]) for axis in ("x", "y", "z")])
+    quaternion = np.array([float(row[key]) for key in ("qx", "qy", "qz", "qw")])
+    return position, quaternion
+
+
 def build_output_paths(directory, bush_id, cane_id, started_at):
     """Return unused output paths for a recording, named by IDs and start time."""
     directory = Path(directory)
-    stamp = started_at.strftime("%Y%m%d_%H%M")
-    stem = f"bush{clean_id(bush_id)}_cane{clean_id(cane_id)}_{stamp}"
+    stem = f"{recording_stem(bush_id, cane_id)}_{started_at:%Y%m%d_%H%M}"
 
     attempt = 1
     while True:
         suffix = "" if attempt == 1 else f"_{attempt}"
         paths = OutputPaths(
-            csv=directory / f"{stem}{suffix}_average.csv",
-            parquet=directory / f"{stem}{suffix}_frames.parquet",
-            snapshot=directory / f"{stem}{suffix}_snapshot.png",
+            csv=directory / f"{stem}{suffix}{AVERAGE_SUFFIX}",
+            parquet=directory / f"{stem}{suffix}{FRAMES_SUFFIX}",
+            snapshot=directory / f"{stem}{suffix}{SNAPSHOT_SUFFIX}",
         )
         if not any(path.exists() for path in (paths.csv, paths.parquet, paths.snapshot)):
             return paths
@@ -352,7 +401,7 @@ def write_average_csv(
                 f"{timestamp:.3f}",
                 reference_id,
                 tag_id,
-                names.get(tag_id, f"tag_{tag_id}"),
+                tag_name(names, tag_id),
                 *(f"{value:.6f}" for value in average.position),
                 *(f"{value:.6f}" for value in average.quaternion),
                 average.n_frames,

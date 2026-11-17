@@ -17,7 +17,6 @@ from PIL import Image, ImageTk
 
 from src.capture import CaptureWorker
 from src.config import load_config
-from src import measurement
 from src.measurement import (
     DISPLAY_FILTER_SECONDS,
     STATUS_FAIR,
@@ -25,6 +24,8 @@ from src.measurement import (
     STATUS_NONE,
     QualityLimits,
     clean_id,
+    judge_quality,
+    tag_name,
 )
 
 # ---- Detection quality: row colours in the tag table -------------------------
@@ -93,11 +94,6 @@ def exposure_to_slider(exposure, low, high):
     return min(position, 1.0)
 
 
-def judge_quality(quality):
-    """Return (status, text) for a tag's live TagQuality, using the limits above."""
-    return measurement.judge_quality(quality, QUALITY_LIMITS)
-
-
 class StatusHold:
     """Show a new status only once it has lasted a while, so colours don't flicker."""
 
@@ -136,11 +132,10 @@ class TrackerApp:
         self.photo = None  # Tk only shows an image while a reference to it exists.
         self.rows = {}     # tag_id -> table row
         self.reference_row = None  # table row for the reference tag, always first
-        self.reference_status = STATUS_NONE
-        self.reference_problem = ""
+        self.reference_judgement = (STATUS_NONE, "")  # (held status, detection text)
+        self.row_contents = {}  # table row -> (values, tags) last shown, to skip redraws
         self.status_hold = StatusHold()
         self.recorded = set()  # tags recorded green for this cane
-        self.all_recorded_shown = False
         self.exposure_ready = False
 
         self.root.title("Tag Measurement")
@@ -318,43 +313,31 @@ class TrackerApp:
         self.cane_entry.focus_set()
         self._set_status("Checkmarks cleared for a new cane. Enter its Cane ID.")
 
-    def _check_off_recordings(self):
-        """Check off tags that finished recordings captured well, and say which."""
-        for result in self.worker.get_finished_recordings():
-            verdict = result.verdict
-            good, poor, reference_problem = (
-                verdict.well_detected, verdict.problems, verdict.reference_problem
+    def _check_off(self, verdict):
+        """Check off the tags a saved recording captured well; return a message saying which."""
+        if verdict.reference_problem:
+            return (
+                f"No tags checked off: the reference wasn't detected well "
+                f"({verdict.reference_problem})."
             )
-            if reference_problem:
-                message = (
-                    f"No tags checked off: the reference wasn't detected well "
-                    f"({reference_problem})."
-                )
-            else:
-                self.recorded.update(good)
-                parts = []
-                if good:
-                    parts.append(f"Checked off: {self._tag_list(good)}.")
-                if poor:
-                    reasons = ", ".join(
-                        f"{self._tag_name(tag_id)} ({text})" for tag_id, text in poor.items()
-                    )
-                    parts.append(f"Not good enough: {reasons}.")
-                message = " ".join(parts) or "No tags were seen with the reference."
-            self._append_status(message)
+        self.recorded.update(verdict.well_detected)
+        parts = []
+        if verdict.well_detected:
+            parts.append(f"Checked off: {self._tag_list(verdict.well_detected)}.")
+        if verdict.problems:
+            reasons = ", ".join(
+                f"{self._tag_name(tag_id)} ({text})" for tag_id, text in verdict.problems.items()
+            )
+            parts.append(f"Not good enough: {reasons}.")
+        return " ".join(parts) or "No tags were seen with the reference."
 
     def _tag_name(self, tag_id):
         """Return a tag's display name."""
-        return self.worker.names.get(tag_id, f"tag_{tag_id}")
+        return tag_name(self.worker.names, tag_id)
 
     def _tag_list(self, tag_ids):
         """Return tag names as a comma-separated list, in ID order."""
         return ", ".join(self._tag_name(tag_id) for tag_id in sorted(tag_ids))
-
-    def _append_status(self, text):
-        """Add a message after the one already in the status bar."""
-        current = self.status_label.cget("text")
-        self.status_label.configure(text=f"{current}  {text}" if current else text)
 
     def _set_status(self, text, is_error=False):
         """Show a message in the status bar."""
@@ -363,7 +346,6 @@ class TrackerApp:
     def poll(self):
         """Show the worker's latest results, then schedule the next poll."""
         self._show_notices()
-        self._check_off_recordings()
         state = self.worker.get_state()
         self._show_connection(state)
         if state is not None and state.sequence != self.last_sequence:
@@ -377,12 +359,21 @@ class TrackerApp:
         self.root.after(POLL_MILLISECONDS, self.poll)
 
     def _show_notices(self):
-        """Show worker messages, joining those that arrive together."""
+        """Show worker messages, joining those that arrive together.
+
+        A saved recording's notice carries its verdict, so its checklist message is
+        shown with it.
+        """
         notices = self.worker.get_notices()
         if not notices:
             return
+        texts = []
+        for notice in notices:
+            texts.append(notice.text)
+            if notice.verdict is not None:
+                texts.append(self._check_off(notice.verdict))
         has_error = any(notice.is_error for notice in notices)
-        self._set_status("  ".join(notice.text for notice in notices), is_error=has_error)
+        self._set_status("  ".join(texts), is_error=has_error)
 
     def _show_connection(self, state):
         """Hide the last frame and say so while the camera is disconnected."""
@@ -428,7 +419,9 @@ class TrackerApp:
         now = time.monotonic()
         tag_ids = [tag_id for tag_id in state.seen_ids if tag_id != state.reference_id]
         for tag_id in set(self.rows) - set(tag_ids):
-            self.table.delete(self.rows.pop(tag_id))
+            row = self.rows.pop(tag_id)
+            self.table.delete(row)
+            self.row_contents.pop(row, None)
 
         for tag_id in tag_ids:
             status, text = self._judge(tag_id, state, now)
@@ -437,7 +430,7 @@ class TrackerApp:
                 status, check = STATUS_DONE, CHECKMARK
             values = (*self._row_values(tag_id, state), text, check)
             if tag_id in self.rows:
-                self.table.item(self.rows[tag_id], values=values, tags=(status,))
+                self._set_row(self.rows[tag_id], values, (status,))
             else:
                 position = sum(other < tag_id for other in self.rows)
                 self.rows[tag_id] = self.table.insert("", position, values=values, tags=(status,))
@@ -449,23 +442,30 @@ class TrackerApp:
         if state.reference_id is None:
             if self.reference_row is not None:
                 self.table.delete(self.reference_row)
+                self.row_contents.pop(self.reference_row, None)
                 self.reference_row = None
-            self.reference_status, self.reference_problem = STATUS_NONE, ""
+            self.reference_judgement = (STATUS_NONE, "")
             return
 
         status, text = self._judge(state.reference_id, state, now)
-        self.reference_status = status
-        self.reference_problem = text if status == STATUS_FAIR else ""
+        self.reference_judgement = (status, text)
         values = (state.reference_id, "reference", "origin", "", "", text, "")
         if self.reference_row is None:
             self.reference_row = self.table.insert("", 0, values=values, tags=(status,))
         else:
-            self.table.item(self.reference_row, values=values, tags=(status,))
-            self.table.move(self.reference_row, "", 0)
+            self._set_row(self.reference_row, values, (status,))
+            if self.table.index(self.reference_row) != 0:
+                self.table.move(self.reference_row, "", 0)
+
+    def _set_row(self, row, values, tags):
+        """Update a table row, skipping it if nothing changed, since each change redraws the table."""
+        if self.row_contents.get(row) != (values, tags):
+            self.row_contents[row] = (values, tags)
+            self.table.item(row, values=values, tags=tags)
 
     def _judge(self, tag_id, state, now):
         """Return a tag's status, held steady against flicker, and its detection text."""
-        status, text = judge_quality(state.quality.get(tag_id))
+        status, text = judge_quality(state.quality.get(tag_id), self.worker.quality_limits)
         return self.status_hold.update(tag_id, status, now), text
 
     def _set_up_exposure(self, state):
@@ -494,8 +494,9 @@ class TrackerApp:
             parts.append(
                 f"{DISPLAY_FILTER_SECONDS:g} s median, relative to tag {state.reference_id}."
             )
-            if self.reference_status != STATUS_GOOD:
-                problem = f" ({self.reference_problem})" if self.reference_problem else ""
+            status, text = self.reference_judgement
+            if status != STATUS_GOOD:
+                problem = f" ({text})" if status == STATUS_FAIR else ""
                 needed = " Recording needs it green." if REQUIRE_GOOD_REFERENCE else ""
                 parts.append(f"The reference isn't detected well{problem}.{needed}")
 
@@ -510,7 +511,7 @@ class TrackerApp:
 
     def _row_values(self, tag_id, state):
         """Return one table row's text."""
-        name = self.worker.names.get(tag_id, f"tag_{tag_id}")
+        name = self._tag_name(tag_id)
         if tag_id in state.relative_positions:
             x, y, z = state.relative_positions[tag_id]
             return (tag_id, name, f"{x:+.3f}", f"{y:+.3f}", f"{z:+.3f}")
@@ -526,7 +527,7 @@ class TrackerApp:
             and state.reference_id is not None
             and state.reference_id in state.visible_ids
         )
-        reference_ok = self.reference_status == STATUS_GOOD or not REQUIRE_GOOD_REFERENCE
+        reference_ok = self.reference_judgement[0] == STATUS_GOOD or not REQUIRE_GOOD_REFERENCE
         ids_entered = clean_id(self.bush_entry.get()) and clean_id(self.cane_entry.get())
         connected = self.worker.is_connected()
         can_record = (
@@ -537,12 +538,10 @@ class TrackerApp:
         self.new_cane_button.configure(state="disabled" if recording else "normal")
         self.hint.configure(text=self._hint_text(state))
         all_recorded = bool(self.rows) and set(self.rows) <= self.recorded
-        if all_recorded != self.all_recorded_shown:
-            self.all_recorded_shown = all_recorded
-            if all_recorded:
-                self.all_recorded_label.pack(anchor="w", pady=(4, 0))
-            else:
-                self.all_recorded_label.pack_forget()
+        if all_recorded and not self.all_recorded_label.winfo_manager():
+            self.all_recorded_label.pack(anchor="w", pady=(4, 0))
+        elif not all_recorded and self.all_recorded_label.winfo_manager():
+            self.all_recorded_label.pack_forget()
 
         exposure_locked = recording or not connected or not self.exposure_ready
         self.auto_check.configure(state="disabled" if exposure_locked else "normal")

@@ -39,6 +39,15 @@ class Config:
     # (for example a larger reference tag).
     tag_sizes_m: dict = field(default_factory=dict)
 
+    def detection_metadata(self) -> dict:
+        """Return the detection settings that every recording's metadata records."""
+        return {
+            "tag_family": self.tag_family,
+            "tag_size_m": self.tag_size_m,
+            "tag_sizes_m": {str(tag_id): size for tag_id, size in self.tag_sizes_m.items()},
+            "decision_margin_threshold": self.decision_margin,
+        }
+
     def build_trackers(self) -> list[Tracker]:
         """Return a fresh Tracker for each object."""
         return [Tracker(obj.name, obj.tag_ids, obj.offsets) for obj in self.objects]
